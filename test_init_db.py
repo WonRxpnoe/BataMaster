@@ -180,6 +180,41 @@ def test_migration_adds_the_place_id_index_to_a_legacy_database():
     assert 'idx_leads_place_id' in indexes
 
 
+def test_creates_the_scrape_runs_table():
+    init_db()
+    with sqlite3.connect(DB_PATH) as conn:
+        columns = [row[1] for row in conn.execute('PRAGMA table_info(scrape_runs)')]
+    assert columns == ['id', 'zip_code', 'state', 'scraped_at', 'leads_found']
+
+
+def test_adds_scrape_runs_to_a_legacy_database():
+    import os
+
+    os.makedirs('data', exist_ok=True)
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(LEGACY_SCHEMA)
+
+    init_db()
+
+    with sqlite3.connect(DB_PATH) as conn:
+        tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+    assert 'scrape_runs' in tables
+
+
+def test_scrape_runs_survive_a_second_init():
+    init_db()
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            "INSERT INTO scrape_runs (zip_code, state, scraped_at, leads_found) "
+            "VALUES ('90210', 'CA', '2026-01-01T00:00:00+00:00', 7)"
+        )
+
+    init_db()
+
+    with sqlite3.connect(DB_PATH) as conn:
+        assert conn.execute('SELECT leads_found FROM scrape_runs').fetchone() == (7,)
+
+
 def test_null_zip_code_bypasses_unique_constraint():
     # SQLite treats NULLs as distinct, so rows missing a zip are never deduplicated
     init_db()

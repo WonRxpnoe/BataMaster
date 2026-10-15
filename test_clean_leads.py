@@ -1,10 +1,25 @@
+import logging
 import sqlite3
 
 import pytest
 
 import clean_leads
-from clean_leads import BROWSER_USER_AGENT, check_email_mx, check_website_live, clean_and_validate_leads
+from clean_leads import (
+    BROWSER_USER_AGENT,
+    check_email_mx,
+    check_website_live,
+    clean_and_validate_leads,
+    has_usable_phone,
+    main,
+    parse_args,
+)
 from init_db import DB_PATH, init_db
+
+
+@pytest.fixture(autouse=True)
+def capture_logs(caplog):
+    caplog.set_level(logging.DEBUG, logger='clean_leads')
+    return caplog
 
 
 class FakeResponse:
@@ -104,13 +119,23 @@ class TestCheckWebsiteLive:
         assert check_website_live('https://glow.example.com') is False
 
 
-def test_creates_the_database_without_running_init_db_first(tmp_path, monkeypatch, capsys):
+def test_creates_the_database_without_running_init_db_first(tmp_path, monkeypatch, capture_logs):
     monkeypatch.chdir(tmp_path)
 
     clean_and_validate_leads()
 
     assert (tmp_path / DB_PATH).is_file()
-    assert 'Cleaning 0 raw leads' in capsys.readouterr().out
+    assert 'Cleaning 0 raw leads' in capture_logs.text
+
+
+class TestHasUsablePhone:
+    @pytest.mark.parametrize('phone', ['(310) 555-0100', '+1 310-555-0100', '3105550100'])
+    def test_accepts_a_full_number(self, phone):
+        assert has_usable_phone(phone) is True
+
+    @pytest.mark.parametrize('phone', [None, '', '555-0100', 'call us', '12345'])
+    def test_rejects_anything_shorter_than_ten_digits(self, phone):
+        assert has_usable_phone(phone) is False
 
 
 class TestCleanAndValidateLeads:
@@ -144,16 +169,16 @@ class TestCleanAndValidateLeads:
         stub_mx(monkeypatch, {'example.com'})
         stub_get(monkeypatch, {'https://glow.example.com': 200})
 
-    def test_marks_a_fully_valid_lead(self, monkeypatch, capsys):
+    def test_marks_a_fully_valid_lead(self, monkeypatch, capture_logs):
         self.insert()
         self.pass_everything(monkeypatch)
 
-        clean_and_validate_leads()
+        assert clean_and_validate_leads() == (1, 0)
 
         assert self.fetch() == [('Glow Med Spa', 'valid', 1)]
-        out = capsys.readouterr().out
-        assert '[VALID] Glow Med Spa' in out
-        assert 'Marked 1 valid and 0 invalid, nothing was deleted' in out
+        text = capture_logs.text
+        assert 'Valid: Glow Med Spa' in text
+        assert 'Marked 1 valid and 0 invalid, nothing was deleted' in text
 
     def test_never_deletes_rows(self, monkeypatch):
         self.insert(business_name='Unreachable Spa', phone='', email='', website='')
@@ -222,28 +247,75 @@ class TestCleanAndValidateLeads:
         clean_and_validate_leads()
         assert self.fetch() == [('Glow Med Spa', 'valid', 1)]
 
-    def test_reports_counts_for_a_mixed_batch(self, monkeypatch, capsys):
+    def test_reports_counts_for_a_mixed_batch(self, monkeypatch, capture_logs):
         self.insert(business_name='Good Spa')
         self.insert(business_name='Phone Only Spa', email='', website='')
         self.insert(business_name='Unreachable Spa', phone='123', email='', website='')
         self.pass_everything(monkeypatch)
 
-        clean_and_validate_leads()
+        assert clean_and_validate_leads() == (2, 1)
 
         assert self.fetch() == [
             ('Good Spa', 'valid', 1),
             ('Phone Only Spa', 'valid', None),
             ('Unreachable Spa', 'invalid', None),
         ]
-        out = capsys.readouterr().out
-        assert 'Marked 2 valid and 1 invalid, nothing was deleted' in out
-        assert 'Of the valid leads, 1 also have a live website' in out
+        text = capture_logs.text
+        assert 'Marked 2 valid and 1 invalid, nothing was deleted' in text
+        assert 'Of the valid leads, 1 also have a live website' in text
 
-    def test_handles_an_empty_database(self, monkeypatch, capsys):
+    def test_handles_an_empty_database(self, monkeypatch, capture_logs):
         self.pass_everything(monkeypatch)
 
         clean_and_validate_leads()
 
-        out = capsys.readouterr().out
-        assert 'Cleaning 0 raw leads' in out
-        assert 'Marked 0 valid and 0 invalid, nothing was deleted' in out
+        text = capture_logs.text
+        assert 'Cleaning 0 raw leads' in text
+        assert 'Marked 0 valid and 0 invalid, nothing was deleted' in text
+
+    def test_only_new_skips_already_validated_leads(self, monkeypatch):
+        self.insert(business_name='Fresh Spa')
+        self.insert(business_name='Done Spa')
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute("UPDATE leads SET status = 'invalid' WHERE business_name = 'Done Spa'")
+        self.pass_everything(monkeypatch)
+
+        assert clean_and_validate_leads(only_new=True) == (1, 0)
+
+        # The already validated lead keeps its earlier verdict
+        assert self.fetch() == [('Done Spa', 'invalid', None), ('Fresh Spa', 'valid', 1)]
+
+    def test_rechecking_everything_can_revise_an_earlier_verdict(self, monkeypatch):
+        self.insert()
+        stub_mx(monkeypatch, set())
+        stub_get(monkeypatch, {})
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute("UPDATE leads SET phone = '', status = 'new'")
+
+        assert clean_and_validate_leads() == (0, 1)
+        assert self.fetch() == [('Glow Med Spa', 'invalid', 0)]
+
+        # Restoring a reachable phone number promotes the lead on the next pass
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute("UPDATE leads SET phone = '(310) 555-0100'")
+        stub_get(monkeypatch, {'https://glow.example.com': 200})
+
+        assert clean_and_validate_leads() == (1, 0)
+        assert self.fetch() == [('Glow Med Spa', 'valid', 1)]
+
+
+class TestCommandLine:
+    def test_defaults_to_checking_every_lead(self):
+        args = parse_args([])
+        assert args.only_new is False
+        assert args.verbose is False
+
+    def test_parses_the_flags(self):
+        args = parse_args(['--only-new', '--verbose'])
+        assert args.only_new is True
+        assert args.verbose is True
+
+    def test_main_returns_zero(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        assert main([]) == 0
+        assert (tmp_path / DB_PATH).is_file()

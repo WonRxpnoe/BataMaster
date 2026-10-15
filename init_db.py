@@ -43,6 +43,16 @@ def init_db():
     # A unique index rather than a column constraint, so existing databases can be upgraded.
     # SQLite treats NULLs as distinct, leaving rows scraped before place_id was stored untouched.
     cursor.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_leads_place_id ON leads(place_id)')
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS scrape_runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            zip_code TEXT NOT NULL,
+            state TEXT NOT NULL,
+            scraped_at TEXT NOT NULL,
+            leads_found INTEGER NOT NULL DEFAULT 0
+        )
+    ''')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_scrape_runs_area ON scrape_runs(zip_code, state)')
     conn.commit()
     conn.close()
 

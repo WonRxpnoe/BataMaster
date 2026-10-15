@@ -1,5 +1,7 @@
 import asyncio
+import logging
 import sqlite3
+import time
 
 import aiohttp
 import pytest
@@ -12,12 +14,38 @@ from medspa_scraper import (
     FatalApiError,
     KEYWORDS,
     MAX_CONCURRENT_REQUESTS,
+    MAX_PAGES_PER_KEYWORD,
+    RateLimiter,
     check_api_response,
     extract_zip_code,
     load_place_details,
+    main,
+    parse_args,
+    recently_scraped_zip_codes,
+    record_scrape_run,
     run_medspa_scraper,
     save_to_sqlite,
 )
+
+
+@pytest.fixture(autouse=True)
+def fast_waits(monkeypatch):
+    """Strip the production delays so the suite does not sleep for real."""
+    monkeypatch.setattr(medspa_scraper, 'PAGE_TOKEN_DELAY', 0)
+    monkeypatch.setattr(medspa_scraper, 'RETRY_BACKOFF', 0)
+    monkeypatch.setattr(medspa_scraper, 'MIN_SECONDS_BETWEEN_REQUESTS', 0)
+
+
+@pytest.fixture(autouse=True)
+def capture_logs(caplog):
+    caplog.set_level(logging.DEBUG, logger='medspa_scraper')
+    return caplog
+
+
+@pytest.fixture
+def single_keyword(monkeypatch):
+    """Reduce the keyword list so page and request counts stay readable."""
+    monkeypatch.setattr(medspa_scraper, 'KEYWORDS', ['Med Spa'])
 
 
 def place(name, **overrides):
@@ -53,19 +81,29 @@ class FakeGoogle:
 
     def __init__(self):
         self.search_payload = {'status': 'OK', 'results': []}
+        self.search_responses = []
         self.search_status = 200
+        self.search_failures = 0
         self.details_payload = {'status': 'OK', 'result': {}}
         self.details_status = 200
         self.details_by_place_id = {}
         self.details_delay = 0
         self.search_queries = []
+        self.search_tokens = []
         self.details_requests = []
         self.in_flight = 0
         self.peak_in_flight = 0
 
     async def handle_search(self, request):
         self.search_queries.append(request.query.get('query'))
-        return web.json_response(self.search_payload, status=self.search_status)
+        self.search_tokens.append(request.query.get('pagetoken'))
+
+        if self.search_failures > 0:
+            self.search_failures -= 1
+            return web.json_response({}, status=500)
+
+        payload = self.search_responses.pop(0) if self.search_responses else self.search_payload
+        return web.json_response(payload, status=self.search_status)
 
     async def handle_details(self, request):
         place_id = request.query.get('place_id')
@@ -83,7 +121,9 @@ class FakeGoogle:
 
 
 @pytest.fixture
-async def google(monkeypatch):
+async def google(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+
     fake = FakeGoogle()
     app = web.Application()
     app.router.add_get('/textsearch', fake.handle_search)
@@ -121,32 +161,110 @@ class TestCheckApiResponse:
         payload = {'status': 'OK', 'results': []}
         assert check_api_response(200, payload, 'ctx') == payload
 
-    def test_treats_zero_results_as_success(self, capsys):
+    def test_treats_zero_results_as_success(self, capture_logs):
         payload = {'status': 'ZERO_RESULTS', 'results': []}
         assert check_api_response(200, payload, 'ctx') == payload
-        assert capsys.readouterr().out == ''
+        assert capture_logs.text == ''
 
-    def test_reports_non_200(self, capsys):
-        assert check_api_response(503, {}, 'ctx') is None
-        assert 'ctx failed: HTTP 503' in capsys.readouterr().out
+    def test_reports_client_error_without_retrying(self, capture_logs):
+        assert check_api_response(404, {}, 'ctx') is None
+        assert 'ctx failed: HTTP 404' in capture_logs.text
 
-    def test_reports_recoverable_status_without_raising(self, capsys):
-        payload = {'status': 'INVALID_REQUEST', 'error_message': 'Missing the query parameter.'}
+    def test_treats_server_error_as_retryable(self):
+        with pytest.raises(medspa_scraper.RetryableApiError, match='HTTP 503'):
+            check_api_response(503, {}, 'ctx')
+
+    def test_reports_permanent_status_without_raising(self, capture_logs):
+        payload = {'status': 'NOT_FOUND', 'error_message': 'gone'}
         assert check_api_response(200, payload, 'ctx') is None
-        out = capsys.readouterr().out
-        assert 'INVALID_REQUEST' in out
-        assert 'Missing the query parameter.' in out
+        assert 'NOT_FOUND' in capture_logs.text
 
-    def test_defaults_missing_status_to_unknown_error(self, capsys):
-        assert check_api_response(200, {'results': []}, 'ctx') is None
-        out = capsys.readouterr().out
-        assert 'UNKNOWN_ERROR' in out
-        assert 'no error_message returned' in out
+    @pytest.mark.parametrize('status', ['UNKNOWN_ERROR', 'INVALID_REQUEST'])
+    def test_treats_transient_statuses_as_retryable(self, status):
+        with pytest.raises(medspa_scraper.RetryableApiError, match=status):
+            check_api_response(200, {'status': status}, 'ctx')
 
     @pytest.mark.parametrize('status', ['REQUEST_DENIED', 'OVER_QUERY_LIMIT'])
     def test_raises_on_account_level_failure(self, status):
         with pytest.raises(FatalApiError, match=status):
             check_api_response(200, {'status': status, 'error_message': 'nope'}, 'ctx')
+
+
+class TestRetries:
+    async def test_recovers_from_a_temporary_server_error(self, google, session, single_keyword, no_email_lookup):
+        google.search_failures = 2
+        google.search_payload = {'status': 'OK', 'results': [place('Glow Med Spa')]}
+
+        leads = await run_medspa_scraper('key', ['90210'])
+
+        assert [item['business_name'] for item in leads] == ['Glow Med Spa']
+        # Two failures plus the successful third attempt
+        assert len(google.search_queries) == 3
+
+    async def test_gives_up_after_the_attempt_limit(self, google, session, single_keyword, no_email_lookup, capture_logs):
+        google.search_failures = 99
+
+        leads = await run_medspa_scraper('key', ['90210'])
+
+        assert leads == []
+        assert len(google.search_queries) == medspa_scraper.MAX_ATTEMPTS
+        assert 'failed after 3 attempts' in capture_logs.text
+
+    async def test_does_not_retry_a_fatal_error(self, google, single_keyword, no_email_lookup):
+        google.search_payload = {'status': 'REQUEST_DENIED', 'error_message': 'invalid key'}
+
+        with pytest.raises(FatalApiError):
+            await run_medspa_scraper('bad-key', ['90210'])
+
+        assert len(google.search_queries) == 1
+
+
+class TestRateLimiter:
+    async def test_spaces_requests_apart(self):
+        limiter = RateLimiter(0.01)
+        started = time.monotonic()
+        for _ in range(5):
+            await limiter.wait()
+        # Four gaps of 10ms between five calls
+        assert time.monotonic() - started >= 0.04
+
+    async def test_zero_interval_does_not_wait(self):
+        limiter = RateLimiter(0)
+        started = time.monotonic()
+        for _ in range(100):
+            await limiter.wait()
+        assert time.monotonic() - started < 0.1
+
+
+class TestPagination:
+    async def test_follows_next_page_token(self, google, single_keyword, no_email_lookup):
+        google.search_responses = [
+            {'status': 'OK', 'results': [place('First')], 'next_page_token': 'token-2'},
+            {'status': 'OK', 'results': [place('Second')], 'next_page_token': 'token-3'},
+            {'status': 'OK', 'results': [place('Third')]},
+        ]
+
+        leads = await run_medspa_scraper('key', ['90210'])
+
+        assert [item['business_name'] for item in leads] == ['First', 'Second', 'Third']
+        assert google.search_tokens == [None, 'token-2', 'token-3']
+
+    async def test_stops_when_no_token_is_returned(self, google, single_keyword, no_email_lookup):
+        google.search_payload = {'status': 'OK', 'results': [place('Only')]}
+
+        leads = await run_medspa_scraper('key', ['90210'])
+
+        assert len(leads) == 1
+        assert len(google.search_queries) == 1
+
+    async def test_never_exceeds_the_page_limit(self, google, single_keyword, no_email_lookup):
+        # A payload that always offers another token would otherwise loop forever
+        google.search_payload = {'status': 'OK', 'results': [place('Endless')], 'next_page_token': 'more'}
+
+        leads = await run_medspa_scraper('key', ['90210'])
+
+        assert len(google.search_queries) == MAX_PAGES_PER_KEYWORD
+        assert len(leads) == MAX_PAGES_PER_KEYWORD
 
 
 class TestExtractZipCode:
@@ -171,9 +289,9 @@ class TestExtractZipCode:
 class TestLoadPlaceDetails:
     async def test_calls_the_api_once_per_place_id(self, google, session):
         cache = {}
-        semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
-
-        avoided = await load_place_details(session, 'key', ['place-1', 'place-1'], cache, semaphore)
+        avoided = await load_place_details(
+            session, 'key', ['place-1', 'place-1'], cache, asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
+        )
 
         assert google.details_requests == ['place-1']
         assert avoided == 1
@@ -181,9 +299,9 @@ class TestLoadPlaceDetails:
 
     async def test_skips_place_ids_already_cached(self, google, session):
         cache = {'place-1': {'website': 'https://cached.example.com'}}
-        semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
-
-        avoided = await load_place_details(session, 'key', ['place-1', 'place-2'], cache, semaphore)
+        avoided = await load_place_details(
+            session, 'key', ['place-1', 'place-2'], cache, asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
+        )
 
         assert google.details_requests == ['place-2']
         assert avoided == 1
@@ -194,7 +312,7 @@ class TestLoadPlaceDetails:
         with pytest.raises(FatalApiError):
             await load_place_details(session, 'key', ['place-1'], {}, asyncio.Semaphore(2))
 
-    async def test_recoverable_error_caches_an_empty_result(self, google, session):
+    async def test_permanent_error_caches_an_empty_result(self, google, session):
         google.details_payload = {'status': 'NOT_FOUND'}
         cache = {}
 
@@ -230,113 +348,169 @@ class TestRunMedspaScraper:
             },
         }
 
-        leads = await run_medspa_scraper('key', zip_code='90210', state='CA')
+        leads = await run_medspa_scraper('key', ['90210'], state='CA')
 
         assert leads[0]['address'] == '9 Rodeo Dr, Beverly Hills, CA 90212, USA'
         assert leads[0]['phone'] == '(310) 555-0100'
         assert leads[0]['email'] == 'hello@glow.example.com'
 
     async def test_stores_the_business_zip_not_the_search_zip(self, google, no_email_lookup):
-        # A text search for 90210 also returns businesses in neighbouring zips
         google.search_payload = {
             'status': 'OK',
             'results': [place('Nearby Spa', formatted_address='9 Rodeo Dr, Beverly Hills, CA 90212, USA')],
         }
 
-        leads = await run_medspa_scraper('key', zip_code='90210', state='CA')
+        leads = await run_medspa_scraper('key', ['90210'], state='CA')
 
         assert leads[0]['zip_code'] == '90212'
 
     async def test_keeps_the_place_id_on_the_lead(self, google, no_email_lookup):
         google.search_payload = {'status': 'OK', 'results': [place('Glow Med Spa')]}
-        leads = await run_medspa_scraper('key')
+        leads = await run_medspa_scraper('key', ['90210'])
         assert leads[0]['place_id'] == 'place-Glow Med Spa'
 
     async def test_falls_back_to_search_address_when_details_are_empty(self, google, no_email_lookup):
         google.search_payload = {'status': 'OK', 'results': [place('Glow Med Spa')]}
-        leads = await run_medspa_scraper('key')
+        leads = await run_medspa_scraper('key', ['90210'])
         assert leads[0]['address'] == '1 Main St, Beverly Hills, CA 90210, USA'
         assert leads[0]['phone'] == ''
         assert leads[0]['website'] == ''
         assert leads[0]['email'] == ''
 
-    async def test_skips_permanently_closed_businesses(self, google, no_email_lookup):
+    async def test_skips_permanently_closed_businesses(self, google, no_email_lookup, single_keyword):
         google.search_payload = {
             'status': 'OK',
             'results': [place('Open Spa'), place('Gone Spa', business_status='CLOSED_PERMANENTLY')],
         }
 
-        leads = await run_medspa_scraper('key')
+        leads = await run_medspa_scraper('key', ['90210'])
 
         assert {item['business_name'] for item in leads} == {'Open Spa'}
         # A closed business must not cost a details lookup either
         assert google.details_requests == ['place-Open Spa']
 
     async def test_searches_every_keyword(self, google, no_email_lookup):
-        await run_medspa_scraper('key', zip_code='90210', state='CA')
+        await run_medspa_scraper('key', ['90210'], state='CA')
         assert google.search_queries == [f'{kw} in 90210, CA' for kw in KEYWORDS]
 
-    async def test_business_matching_every_keyword_is_billed_once(self, google, no_email_lookup, capsys):
+    async def test_business_matching_every_keyword_is_billed_once(self, google, no_email_lookup, capture_logs):
         google.search_payload = {'status': 'OK', 'results': [place('Glow Med Spa')]}
         google.details_payload = {'status': 'OK', 'result': {'formatted_phone_number': '(310) 555-0100'}}
 
-        leads = await run_medspa_scraper('key')
+        leads = await run_medspa_scraper('key', ['90210'])
 
         assert google.details_requests == ['place-Glow Med Spa']
         assert len(leads) == len(KEYWORDS)
         assert all(item['phone'] == '(310) 555-0100' for item in leads)
-        assert f'1 unique businesses, {len(KEYWORDS) - 1} duplicate lookups avoided' in capsys.readouterr().out
+        assert f'1 unique businesses, {len(KEYWORDS) - 1} duplicate lookups avoided' in capture_logs.text
 
     async def test_rejected_key_aborts_and_carries_partial_results(self, google, no_email_lookup):
         google.search_payload = {'status': 'REQUEST_DENIED', 'error_message': 'The provided API key is invalid.'}
 
         with pytest.raises(FatalApiError) as excinfo:
-            await run_medspa_scraper('bad-key')
+            await run_medspa_scraper('bad-key', ['90210'])
 
         assert excinfo.value.partial_leads == []
         # The remaining keywords are skipped rather than repeating the same failure
         assert len(google.search_queries) == 1
 
-    async def test_partial_results_survive_a_mid_run_quota_failure(self, google, no_email_lookup):
-        google.search_payload = {'status': 'OK', 'results': [place('Glow Med Spa')]}
-        google.details_by_place_id['place-Glow Med Spa'] = {'status': 'OK', 'result': {}}
+    async def test_permanent_search_error_keeps_other_keywords_running(self, google, no_email_lookup, capture_logs):
+        google.search_payload = {'status': 'NOT_FOUND', 'error_message': 'nothing here'}
 
-        original = medspa_scraper.fetch_api_json
-        seen = {'searches': 0}
-
-        async def failing_after_first_keyword(session, url, params, context):
-            if url == medspa_scraper.SEARCH_URL:
-                seen['searches'] += 1
-                if seen['searches'] == 2:
-                    raise FatalApiError('OVER_QUERY_LIMIT - quota exhausted')
-            return await original(session, url, params, context)
-
-        medspa_scraper.fetch_api_json = failing_after_first_keyword
-        try:
-            with pytest.raises(FatalApiError) as excinfo:
-                await run_medspa_scraper('key')
-        finally:
-            medspa_scraper.fetch_api_json = original
-
-        # Everything gathered before the quota ran out is still available to save
-        assert [item['business_name'] for item in excinfo.value.partial_leads] == ['Glow Med Spa']
-
-    async def test_recoverable_search_error_keeps_other_keywords_running(self, google, no_email_lookup, capsys):
-        google.search_payload = {'status': 'INVALID_REQUEST', 'error_message': 'bad query'}
-
-        leads = await run_medspa_scraper('key')
+        leads = await run_medspa_scraper('key', ['90210'])
 
         assert leads == []
-        assert capsys.readouterr().out.count('INVALID_REQUEST') == len(KEYWORDS)
+        assert capture_logs.text.count('NOT_FOUND') == len(KEYWORDS)
         assert len(google.search_queries) == len(KEYWORDS)
 
-    async def test_non_200_search_response_is_reported(self, google, no_email_lookup, capsys):
-        google.search_status = 503
 
-        leads = await run_medspa_scraper('key')
+class TestMultipleZipCodes:
+    async def test_scrapes_every_requested_zip_code(self, google, no_email_lookup, single_keyword):
+        google.search_payload = {'status': 'OK', 'results': [place('Glow Med Spa')]}
 
-        assert leads == []
-        assert capsys.readouterr().out.count('HTTP 503') == len(KEYWORDS)
+        await run_medspa_scraper('key', ['90210', '90211'], state='CA')
+
+        assert google.search_queries == ['Med Spa in 90210, CA', 'Med Spa in 90211, CA']
+
+    async def test_shares_the_details_cache_between_zip_codes(self, google, no_email_lookup, single_keyword):
+        # Neighbouring zip searches routinely surface the same business
+        google.search_payload = {'status': 'OK', 'results': [place('Glow Med Spa')]}
+
+        leads = await run_medspa_scraper('key', ['90210', '90211'])
+
+        assert google.details_requests == ['place-Glow Med Spa']
+        assert len(leads) == 2
+
+    async def test_accepts_numeric_zip_codes(self, google, no_email_lookup, single_keyword):
+        await run_medspa_scraper('key', [90210], state='CA')
+        assert google.search_queries == ['Med Spa in 90210, CA']
+
+    async def test_records_a_run_for_each_completed_zip_code(self, google, no_email_lookup, single_keyword):
+        google.search_payload = {'status': 'OK', 'results': [place('Glow Med Spa')]}
+
+        await run_medspa_scraper('key', ['90210', '90211'], state='CA')
+
+        with sqlite3.connect(DB_PATH) as conn:
+            rows = conn.execute('SELECT zip_code, state, leads_found FROM scrape_runs ORDER BY zip_code').fetchall()
+        assert rows == [('90210', 'CA', 1), ('90211', 'CA', 1)]
+
+    async def test_a_fatal_error_leaves_the_unfinished_zip_unrecorded(self, google, no_email_lookup, single_keyword):
+        init_db()
+        google.search_payload = {'status': 'REQUEST_DENIED', 'error_message': 'invalid key'}
+
+        with pytest.raises(FatalApiError):
+            await run_medspa_scraper('bad-key', ['90210'])
+
+        with sqlite3.connect(DB_PATH) as conn:
+            assert conn.execute('SELECT COUNT(*) FROM scrape_runs').fetchone()[0] == 0
+
+
+class TestIncrementalRuns:
+    @pytest.fixture(autouse=True)
+    def workdir(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        init_db()
+
+    def test_reports_nothing_when_the_window_is_disabled(self):
+        record_scrape_run('90210', 'CA', 3)
+        assert recently_scraped_zip_codes(['90210'], 'CA', 0) == set()
+
+    def test_finds_a_zip_scraped_inside_the_window(self):
+        record_scrape_run('90210', 'CA', 3)
+        assert recently_scraped_zip_codes(['90210', '90211'], 'CA', 7) == {'90210'}
+
+    def test_ignores_a_zip_scraped_before_the_window(self):
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute(
+                "INSERT INTO scrape_runs (zip_code, state, scraped_at, leads_found) "
+                "VALUES ('90210', 'CA', '2020-01-01T00:00:00+00:00', 5)"
+            )
+        assert recently_scraped_zip_codes(['90210'], 'CA', 7) == set()
+
+    def test_separates_identical_zips_in_different_states(self):
+        record_scrape_run('90210', 'CA', 3)
+        assert recently_scraped_zip_codes(['90210'], 'NV', 7) == set()
+
+
+class TestSkipRecent:
+    async def test_skips_a_recently_scraped_zip(self, google, no_email_lookup, single_keyword, capture_logs):
+        init_db()
+        record_scrape_run('90210', 'CA', 4)
+        google.search_payload = {'status': 'OK', 'results': [place('Glow Med Spa')]}
+
+        leads = await run_medspa_scraper('key', ['90210', '90211'], state='CA', skip_recent_days=7)
+
+        assert google.search_queries == ['Med Spa in 90211, CA']
+        assert len(leads) == 1
+        assert 'Skipping 90210' in capture_logs.text
+
+    async def test_scrapes_everything_when_the_window_is_zero(self, google, no_email_lookup, single_keyword):
+        init_db()
+        record_scrape_run('90210', 'CA', 4)
+
+        await run_medspa_scraper('key', ['90210'], state='CA', skip_recent_days=0)
+
+        assert google.search_queries == ['Med Spa in 90210, CA']
 
 
 class TestSaveToSqlite:
@@ -345,15 +519,15 @@ class TestSaveToSqlite:
         monkeypatch.chdir(tmp_path)
 
     def test_creates_the_database_without_running_init_db_first(self, tmp_path):
-        save_to_sqlite([lead()])
+        assert save_to_sqlite([lead()]) == 1
 
         assert (tmp_path / DB_PATH).is_file()
         with sqlite3.connect(DB_PATH) as conn:
             assert conn.execute('SELECT COUNT(*) FROM leads').fetchone()[0] == 1
 
-    def test_does_nothing_for_empty_input(self, tmp_path, capsys):
-        save_to_sqlite([])
-        assert 'No valid leads were scraped' in capsys.readouterr().out
+    def test_does_nothing_for_empty_input(self, tmp_path, capture_logs):
+        assert save_to_sqlite([]) == 0
+        assert 'No valid leads were scraped' in capture_logs.text
         assert not (tmp_path / DB_PATH).exists()
 
     def test_persists_all_lead_columns(self):
@@ -376,27 +550,83 @@ class TestSaveToSqlite:
             'place-Glow Med Spa',
         )
 
-    def test_same_place_id_is_only_stored_once(self, capsys):
+    def test_same_place_id_is_only_stored_once(self, capture_logs):
         # The same business under two keywords, and now under two different zips
-        save_to_sqlite([lead(), lead(industry='MedSpa/Esthetics (Facial Spa)', zip_code='90212')])
+        assert save_to_sqlite([lead(), lead(industry='MedSpa/Esthetics (Facial Spa)', zip_code='90212')]) == 1
 
         with sqlite3.connect(DB_PATH) as conn:
             rows = conn.execute('SELECT industry FROM leads').fetchall()
         assert rows == [('MedSpa/Esthetics (Med Spa)',)]
-        assert 'Saved 1 new leads' in capsys.readouterr().out
+        assert 'Saved 1 new leads' in capture_logs.text
 
     def test_distinct_businesses_are_all_stored(self):
         save_to_sqlite([lead(), lead(business_name='Other Spa', place_id='place-Other Spa')])
         with sqlite3.connect(DB_PATH) as conn:
             assert conn.execute('SELECT COUNT(*) FROM leads').fetchone()[0] == 2
 
-    def test_reports_inserted_count_and_coverage(self, capsys):
-        init_db()
+    def test_reports_inserted_count_and_coverage(self, capture_logs):
         save_to_sqlite([lead(), lead(business_name='Bare Spa', place_id='p2', phone='', email='', address='')])
 
-        out = capsys.readouterr().out
-        assert 'Saved 2 new leads' in out
-        assert 'Coverage of fetched leads: 1 with address, 1 with phone, 1 with email' in out
+        text = capture_logs.text
+        assert 'Saved 2 new leads' in text
+        assert 'Coverage of fetched leads: 1 with address, 1 with phone, 1 with email' in text
+
+
+class TestCommandLine:
+    def test_requires_at_least_one_zip(self):
+        with pytest.raises(SystemExit):
+            parse_args([])
+
+    def test_parses_several_zips_and_options(self):
+        args = parse_args(['--zip', '90210', '90211', '--state', 'NV', '--skip-recent', '7', '--verbose'])
+        assert args.zip_codes == ['90210', '90211']
+        assert args.state == 'NV'
+        assert args.skip_recent == 7
+        assert args.verbose is True
+
+    def test_defaults_to_california_and_no_skipping(self):
+        args = parse_args(['--zip', '90210'])
+        assert args.state == 'CA'
+        assert args.skip_recent == 0
+        assert args.verbose is False
+
+    def test_exits_non_zero_without_an_api_key(self, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.delenv('GOOGLE_API_KEY', raising=False)
+        assert main(['--zip', '90210']) == 1
+
+    def test_exits_non_zero_for_the_placeholder_key(self, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('GOOGLE_API_KEY', 'YOUR_API_KEY_HERE')
+        assert main(['--zip', '90210']) == 1
+
+    def test_returns_zero_on_a_successful_run(self, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('GOOGLE_API_KEY', 'real-key')
+
+        async def fake_run(api_key, zip_codes, state, skip_recent_days):
+            assert (api_key, zip_codes, state, skip_recent_days) == ('real-key', ['90210'], 'CA', 0)
+            return [lead()]
+
+        monkeypatch.setattr(medspa_scraper, 'run_medspa_scraper', fake_run)
+        assert main(['--zip', '90210']) == 0
+
+        with sqlite3.connect(DB_PATH) as conn:
+            assert conn.execute('SELECT COUNT(*) FROM leads').fetchone()[0] == 1
+
+    def test_saves_partial_results_before_exiting_non_zero(self, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('GOOGLE_API_KEY', 'real-key')
+
+        async def fake_run(api_key, zip_codes, state, skip_recent_days):
+            raise FatalApiError('OVER_QUERY_LIMIT - quota exhausted', partial_leads=[lead()])
+
+        monkeypatch.setattr(medspa_scraper, 'run_medspa_scraper', fake_run)
+        assert main(['--zip', '90210']) == 1
+
+        # The leads already paid for are still written to the database
+        with sqlite3.connect(DB_PATH) as conn:
+            assert conn.execute('SELECT COUNT(*) FROM leads').fetchone()[0] == 1
 
 
 def html_response(body):
