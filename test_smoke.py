@@ -280,6 +280,56 @@ class TestCostGuardsEndToEnd:
         assert export_leads(output_path=CSV_PATH) > 0
 
 
+class TestMessySitesAndRepeatListings:
+    """The pipeline meets pages built to sell, not to be read by a program."""
+
+    def exported(self):
+        return pd.read_csv(CSV_PATH)
+
+    async def run_everything(self):
+        await scrape(['90210'])
+        await clean()
+        export_leads()
+
+    async def test_an_address_only_on_a_contact_page_still_reaches_the_csv(self, pipeline):
+        await self.run_everything()
+
+        frame = self.exported()
+        hidden = frame[frame['business_name'].str.startswith('Hidden Contact Spa')]
+        # Its homepage offers nothing but a link, so this address is only reachable
+        # by following the link the business published
+        assert hidden['email'].tolist() == ['owner@hidden-spa.example']
+
+    async def test_a_noisy_homepage_yields_the_businesss_own_address(self, pipeline):
+        await self.run_everything()
+
+        frame = self.exported()
+        noisy = frame[frame['business_name'].str.startswith('Noisy Site Spa')]
+        assert noisy['email'].tolist() == ['owner@noisy-spa.example']
+
+    async def test_two_google_entries_for_one_shop_become_one_row(self, pipeline):
+        await self.run_everything()
+
+        stored = [name for name, *_ in rows() if name.startswith('Glow Med Spa')]
+        exported = self.exported()['business_name']
+        # Both entries stay on record, because dropping one would lose what Google said
+        assert len(stored) == 2
+        assert exported.str.startswith('Glow Med Spa').sum() == 1
+
+    async def test_no_exported_address_is_mangled_or_borrowed(self, pipeline):
+        await self.run_everything()
+
+        addresses = [a for a in self.exported()['email'].dropna()]
+        assert addresses, 'the run produced no addresses to check'
+        for address in addresses:
+            # Everything the mock sites try to pass off as a contact address
+            assert 'squarespace' not in address
+            assert 'sentry' not in address
+            assert address != 'you@email.com'
+            assert not address.lower().endswith('.png')
+            assert address.count('@') == 1
+
+
 class TestStageContracts:
     async def test_every_column_the_cleaner_reads_is_written_by_the_scraper(self, pipeline):
         await scrape(['90210'])

@@ -33,15 +33,25 @@ BUSINESS_TEMPLATES = [
      'email': 'book@quiet.example'},
     {'slug': 'bounce', 'name': 'Bounce Aesthetics', 'has_site': True, 'phone': None,
      'email': 'owner@bounce.invalid'},
+    # Its address is printed on a contact page the homepage links to, not on the homepage
+    {'slug': 'hidden', 'name': 'Hidden Contact Spa', 'has_site': True, 'phone': None,
+     'email': 'owner@hidden-spa.example', 'email_on_contact_page': True},
+    # Its homepage also carries an asset filename and the address of whoever built it
+    {'slug': 'noisy', 'name': 'Noisy Site Spa', 'has_site': True, 'phone': None,
+     'email': 'owner@noisy-spa.example', 'noisy_site': True},
+    # The same shop as 'glow', which Google holds a second, separate entry for
+    {'slug': 'twin', 'name': 'Glow Med Spa LLC', 'has_site': True, 'email': None,
+     'duplicate_of': 'glow'},
 ]
 
 
 def businesses_for(zip_code):
     """Build the full, deterministic business list for one zip code."""
     businesses = []
+    by_slug = {}
     for index, template in enumerate(BUSINESS_TEMPLATES):
         slug = f"{zip_code}-{template['slug']}"
-        businesses.append({
+        business = {
             'slug': slug,
             'place_id': f'mock-place-{slug}',
             'name': f"{template['name']} {zip_code}",
@@ -50,7 +60,16 @@ def businesses_for(zip_code):
             'has_site': template['has_site'],
             'email': template['email'],
             'closed': template.get('closed', False),
-        })
+            'email_on_contact_page': template.get('email_on_contact_page', False),
+            'noisy_site': template.get('noisy_site', False),
+        }
+        # A second entry for one shop repeats its address and phone, which is what makes
+        # the pair recognisable as a single business further down the pipeline
+        original = by_slug.get(template.get('duplicate_of'))
+        if original:
+            business.update(address=original['address'], phone=original['phone'])
+        by_slug[template['slug']] = business
+        businesses.append(business)
     return businesses
 
 
@@ -131,17 +150,58 @@ async def handle_details(request):
     return web.json_response({'status': 'OK', 'result': result})
 
 
-async def handle_site(request):
-    slug = request.match_info['slug']
+def site_body(business, on_contact_page=False):
+    """The homepage a business serves, or its contact page when asked for that."""
+    heading = f"<h1>{business['name']}</h1>"
+
+    if business['email_on_contact_page'] and not on_contact_page:
+        return f"{heading}<a href='/site/{business['slug']}/contact'>Contact</a>"
+
+    if not business['email']:
+        return f'{heading}<p>Call us today.</p>'
+
+    if business['noisy_site']:
+        # Everything a real page puts in front of the address a visitor is looking for
+        domain = business['email'].split('@')[1]
+        return (
+            f'{heading}<img src="logo@2x.PNG">'
+            '<!-- built by support@squarespace.com -->'
+            '<script>Sentry.init({dsn:"https://k@o1.ingest.sentry.io/4"});'
+            # On the business's own domain, so only ignoring scripts can rule it out
+            f'var cfg={{notify:"no-reply@{domain}"}};</script>'
+            '<input placeholder="you@email.com">'
+            f"<p>Email: {business['email']}</p>"
+        )
+
+    return f"{heading}<p>Email: {business['email']}</p>"
+
+
+def find_by_slug(slug):
     zip_code = slug.split('-')[0]
     for business in businesses_for(zip_code):
         if business['slug'] == slug:
-            contact = f"<p>Email: {business['email']}</p>" if business['email'] else '<p>Call us today.</p>'
-            return web.Response(
-                text=f"<html><body><h1>{business['name']}</h1>{contact}</body></html>",
-                content_type='text/html',
-            )
-    return web.Response(status=404, text='Not found')
+            return business
+    return None
+
+
+async def handle_site(request):
+    business = find_by_slug(request.match_info['slug'])
+    if business is None:
+        return web.Response(status=404, text='Not found')
+    return web.Response(
+        text=f"<html><body>{site_body(business)}</body></html>",
+        content_type='text/html',
+    )
+
+
+async def handle_contact_page(request):
+    business = find_by_slug(request.match_info['slug'])
+    if business is None:
+        return web.Response(status=404, text='Not found')
+    return web.Response(
+        text=f"<html><body>{site_body(business, on_contact_page=True)}</body></html>",
+        content_type='text/html',
+    )
 
 
 def create_app():
@@ -149,6 +209,7 @@ def create_app():
     app.router.add_get('/textsearch/json', handle_search)
     app.router.add_get('/details/json', handle_details)
     app.router.add_get('/site/{slug}', handle_site)
+    app.router.add_get('/site/{slug}/contact', handle_contact_page)
     return app
 
 
