@@ -96,6 +96,22 @@ def _first_present(values):
     return present.iloc[0] if len(present) else values.iloc[0]
 
 
+# A merged row carries the contact details of every listing behind it, so a verdict
+# reached on one listing alone can only understate how reachable the business is
+STATUS_RANK = {'invalid': 0, 'new': 1, 'valid': 2}
+
+
+def _best_status(values):
+    """The most favourable verdict any of the merged listings earned."""
+    return max(values, key=lambda status: STATUS_RANK.get(status, -1))
+
+
+def _best_liveness(values):
+    """A website that answered for one listing answers for the business."""
+    present = values[values.notna()]
+    return present.max() if len(present) else values.iloc[0]
+
+
 def merge_duplicate_listings(frame):
     """Collapse repeated listings of one business into a single row.
 
@@ -105,7 +121,13 @@ def merge_duplicate_listings(frame):
     if frame.empty:
         return frame
     groups = group_one_business_together(frame)
-    merged = frame.groupby(groups, sort=False).agg(_first_present)
+    # status and website_live are conclusions the cleaner reached about a single
+    # listing, so merging them the way a phone number is merged would carry over a
+    # verdict that the combined contact details have already outgrown
+    how = dict.fromkeys(frame.columns, _first_present)
+    how['status'] = _best_status
+    how['website_live'] = _best_liveness
+    merged = frame.groupby(groups, sort=False).agg(how)
     return merged.reset_index(drop=True).sort_values('business_name', ignore_index=True)
 
 

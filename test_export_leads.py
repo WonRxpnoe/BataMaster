@@ -196,6 +196,34 @@ class TestRepeatListingsBecomeOneBusiness:
         assert row['website'] == 'https://glow.example.com'
         assert row['email'] == 'sales@example.com'
 
+    def test_the_merged_row_carries_the_most_favourable_verdict(self, workdir):
+        # The rejected listing was judged before the other one supplied a phone number
+        insert('Glow Med Spa', status='invalid', phone='', email='', **self.SHARED)
+        insert('Glow Med Spa', status='valid', place_id='other-listing', **self.SHARED)
+
+        assert export_leads(status=None) == 1
+
+        row = pd.read_csv(workdir / DEFAULT_OUTPUT).loc[0]
+        assert row['phone'] == '(310) 555-0100'
+        assert row['status'] == 'valid'
+
+    def test_a_site_that_answered_for_one_listing_counts_for_the_business(self, workdir):
+        insert('Glow Med Spa', website_live=0, **self.SHARED)
+        insert('Glow Med Spa', website_live=1, place_id='other-listing', **self.SHARED)
+
+        export_leads()
+
+        assert pd.read_csv(workdir / DEFAULT_OUTPUT).loc[0, 'website_live'] == 1
+
+    def test_a_business_with_no_website_keeps_an_empty_liveness_flag(self, workdir):
+        insert('Glow Med Spa', website='', website_live=None, **self.SHARED)
+        insert('Glow Med Spa', website='', website_live=None, place_id='other-listing',
+               **self.SHARED)
+
+        export_leads()
+
+        assert pd.read_csv(workdir / DEFAULT_OUTPUT).loc[0, 'website_live'] != 1
+
     def test_merging_is_reported(self, workdir, capture_logs):
         insert('Glow Med Spa', **self.SHARED)
         insert('Glow Med Spa', place_id='other-listing', **self.SHARED)
