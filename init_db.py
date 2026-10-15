@@ -1,11 +1,14 @@
 import os
 import sqlite3
-import pandas as pd
+
+DB_DIR = 'data'
+DB_PATH = 'data/leads.db'
 
 # Columns introduced after the first release, applied to databases created earlier
 LATER_COLUMNS = {
     'status': "TEXT NOT NULL DEFAULT 'new'",
     'website_live': 'INTEGER',
+    'place_id': 'TEXT',
 }
 
 def add_missing_columns(cursor):
@@ -15,8 +18,8 @@ def add_missing_columns(cursor):
             cursor.execute(f'ALTER TABLE leads ADD COLUMN {column} {definition}')
 
 def init_db():
-    os.makedirs('data', exist_ok=True)
-    conn = sqlite3.connect('data/leads.db')
+    os.makedirs(DB_DIR, exist_ok=True)
+    conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS leads (
@@ -32,10 +35,14 @@ def init_db():
             source TEXT,
             status TEXT NOT NULL DEFAULT 'new',
             website_live INTEGER,
+            place_id TEXT,
             UNIQUE(business_name, zip_code)
         )
     ''')
     add_missing_columns(cursor)
+    # A unique index rather than a column constraint, so existing databases can be upgraded.
+    # SQLite treats NULLs as distinct, leaving rows scraped before place_id was stored untouched.
+    cursor.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_leads_place_id ON leads(place_id)')
     conn.commit()
     conn.close()
 

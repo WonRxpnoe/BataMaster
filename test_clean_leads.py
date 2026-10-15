@@ -4,9 +4,7 @@ import pytest
 
 import clean_leads
 from clean_leads import BROWSER_USER_AGENT, check_email_mx, check_website_live, clean_and_validate_leads
-from init_db import init_db
-
-DB_PATH = 'data/leads.db'
+from init_db import DB_PATH, init_db
 
 
 class FakeResponse:
@@ -104,6 +102,15 @@ class TestCheckWebsiteLive:
     def test_rejects_unreachable_host(self, monkeypatch):
         stub_get(monkeypatch, {})
         assert check_website_live('https://glow.example.com') is False
+
+
+def test_creates_the_database_without_running_init_db_first(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+
+    clean_and_validate_leads()
+
+    assert (tmp_path / DB_PATH).is_file()
+    assert 'Cleaning 0 raw leads' in capsys.readouterr().out
 
 
 class TestCleanAndValidateLeads:

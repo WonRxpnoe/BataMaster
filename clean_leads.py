@@ -1,8 +1,9 @@
 import dns.resolver
 import re
-import socket
 import sqlite3
 import requests
+
+from init_db import DB_PATH, init_db
 
 EMAIL_REGEX = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
 
@@ -45,7 +46,8 @@ def check_website_live(website):
 
 def clean_and_validate_leads():
     """3. Read leads from the database and record how usable each one is."""
-    conn = sqlite3.connect("data/leads.db")
+    init_db()
+    conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     
     # Load every raw lead that was scraped

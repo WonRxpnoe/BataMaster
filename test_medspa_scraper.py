@@ -1,3 +1,4 @@
+import asyncio
 import sqlite3
 
 import aiohttp
@@ -6,37 +7,24 @@ from aiohttp import web
 from aiohttp.test_utils import TestServer
 
 import medspa_scraper
-from init_db import init_db
+from init_db import DB_PATH, init_db
 from medspa_scraper import (
     FatalApiError,
     KEYWORDS,
+    MAX_CONCURRENT_REQUESTS,
     check_api_response,
-    get_cached_place_details,
-    get_place_details,
+    extract_zip_code,
+    load_place_details,
     run_medspa_scraper,
     save_to_sqlite,
 )
-
-DB_PATH = 'data/leads.db'
-
-SEARCH_URL = 'https://maps.googleapis.com/maps/api/place/textsearch/json'
-DETAILS_URL = 'https://maps.googleapis.com/maps/api/place/details/json'
-
-
-class FakeResponse:
-    def __init__(self, payload, status_code=200):
-        self._payload = payload
-        self.status_code = status_code
-
-    def json(self):
-        return self._payload
 
 
 def place(name, **overrides):
     payload = {
         'name': name,
         'place_id': f'place-{name}',
-        'formatted_address': 'Search address',
+        'formatted_address': '1 Main St, Beverly Hills, CA 90210, USA',
         'business_status': 'OPERATIONAL',
     }
     payload.update(overrides)
@@ -53,10 +41,61 @@ def lead(**overrides):
         'state': 'CA',
         'zip_code': '90210',
         'address': '1 Main St',
+        'place_id': 'place-Glow Med Spa',
         'source': 'Google_Places',
     }
     payload.update(overrides)
     return payload
+
+
+class FakeGoogle:
+    """A local stand-in for the two Places endpoints, exercised over real HTTP."""
+
+    def __init__(self):
+        self.search_payload = {'status': 'OK', 'results': []}
+        self.search_status = 200
+        self.details_payload = {'status': 'OK', 'result': {}}
+        self.details_status = 200
+        self.details_by_place_id = {}
+        self.details_delay = 0
+        self.search_queries = []
+        self.details_requests = []
+        self.in_flight = 0
+        self.peak_in_flight = 0
+
+    async def handle_search(self, request):
+        self.search_queries.append(request.query.get('query'))
+        return web.json_response(self.search_payload, status=self.search_status)
+
+    async def handle_details(self, request):
+        place_id = request.query.get('place_id')
+        self.details_requests.append(place_id)
+
+        self.in_flight += 1
+        self.peak_in_flight = max(self.peak_in_flight, self.in_flight)
+        try:
+            if self.details_delay:
+                await asyncio.sleep(self.details_delay)
+            payload = self.details_by_place_id.get(place_id, self.details_payload)
+            return web.json_response(payload, status=self.details_status)
+        finally:
+            self.in_flight -= 1
+
+
+@pytest.fixture
+async def google(monkeypatch):
+    fake = FakeGoogle()
+    app = web.Application()
+    app.router.add_get('/textsearch', fake.handle_search)
+    app.router.add_get('/details', fake.handle_details)
+
+    server = TestServer(app)
+    await server.start_server()
+    monkeypatch.setattr(medspa_scraper, 'SEARCH_URL', str(server.make_url('/textsearch')))
+    monkeypatch.setattr(medspa_scraper, 'DETAILS_URL', str(server.make_url('/details')))
+
+    yield fake
+    await server.close()
 
 
 @pytest.fixture
@@ -71,281 +110,258 @@ def no_email_lookup(monkeypatch):
     return emails
 
 
-def stub_api(monkeypatch, search_payload, details_payload=None):
-    """Route each endpoint to a canned payload and record the requests made."""
-    calls = []
-
-    def fake_get(url, params=None, timeout=None):
-        calls.append((url, params))
-        if url == SEARCH_URL:
-            return FakeResponse(search_payload)
-        return FakeResponse(details_payload if details_payload is not None else {'status': 'OK', 'result': {}})
-
-    monkeypatch.setattr(medspa_scraper.requests, 'get', fake_get)
-    return calls
+@pytest.fixture
+async def session():
+    async with aiohttp.ClientSession() as client_session:
+        yield client_session
 
 
 class TestCheckApiResponse:
     def test_returns_payload_for_ok(self):
         payload = {'status': 'OK', 'results': []}
-        assert check_api_response(FakeResponse(payload), 'ctx') == payload
+        assert check_api_response(200, payload, 'ctx') == payload
 
     def test_treats_zero_results_as_success(self, capsys):
         payload = {'status': 'ZERO_RESULTS', 'results': []}
-        assert check_api_response(FakeResponse(payload), 'ctx') == payload
+        assert check_api_response(200, payload, 'ctx') == payload
         assert capsys.readouterr().out == ''
 
-    def test_reports_non_200_without_parsing_body(self, capsys):
-        assert check_api_response(FakeResponse({}, status_code=503), 'ctx') is None
+    def test_reports_non_200(self, capsys):
+        assert check_api_response(503, {}, 'ctx') is None
         assert 'ctx failed: HTTP 503' in capsys.readouterr().out
 
     def test_reports_recoverable_status_without_raising(self, capsys):
         payload = {'status': 'INVALID_REQUEST', 'error_message': 'Missing the query parameter.'}
-        assert check_api_response(FakeResponse(payload), 'ctx') is None
+        assert check_api_response(200, payload, 'ctx') is None
         out = capsys.readouterr().out
         assert 'INVALID_REQUEST' in out
         assert 'Missing the query parameter.' in out
 
     def test_defaults_missing_status_to_unknown_error(self, capsys):
-        assert check_api_response(FakeResponse({'results': []}), 'ctx') is None
+        assert check_api_response(200, {'results': []}, 'ctx') is None
         out = capsys.readouterr().out
         assert 'UNKNOWN_ERROR' in out
         assert 'no error_message returned' in out
 
     @pytest.mark.parametrize('status', ['REQUEST_DENIED', 'OVER_QUERY_LIMIT'])
     def test_raises_on_account_level_failure(self, status):
-        payload = {'status': status, 'error_message': 'nope'}
         with pytest.raises(FatalApiError, match=status):
-            check_api_response(FakeResponse(payload), 'ctx')
+            check_api_response(200, {'status': status, 'error_message': 'nope'}, 'ctx')
 
 
-class TestGetPlaceDetails:
-    def test_returns_result_payload(self, monkeypatch):
-        details = {'formatted_phone_number': '(310) 555-0100', 'website': 'https://glow.example.com'}
-        monkeypatch.setattr(
-            medspa_scraper.requests,
-            'get',
-            lambda url, params=None, timeout=None: FakeResponse({'status': 'OK', 'result': details}),
-        )
-        assert get_place_details('test-key', 'place-1') == details
+class TestExtractZipCode:
+    @pytest.mark.parametrize(
+        'address, expected',
+        [
+            ('1 Main St, Beverly Hills, CA 90210, USA', '90210'),
+            ('1 Main St, Beverly Hills, CA 90210-1234, USA', '90210'),
+            ('500 Industrial Pkwy, Reno, NV 89502', '89502'),
+            # A five digit street number must not be mistaken for the ZIP
+            ('90210 Wilshire Blvd, Los Angeles, CA 90024', '90024'),
+        ],
+    )
+    def test_reads_the_zip_that_follows_the_state_code(self, address, expected):
+        assert extract_zip_code(address, '00000') == expected
 
-    def test_returns_empty_dict_on_recoverable_error(self, monkeypatch, capsys):
-        monkeypatch.setattr(
-            medspa_scraper.requests,
-            'get',
-            lambda url, params=None, timeout=None: FakeResponse({'status': 'NOT_FOUND'}),
-        )
-        assert get_place_details('test-key', 'place-1') == {}
-        assert 'NOT_FOUND' in capsys.readouterr().out
+    @pytest.mark.parametrize('address', [None, '', 'Somewhere in France'])
+    def test_falls_back_to_the_search_zip(self, address):
+        assert extract_zip_code(address, 90210) == '90210'
 
-    def test_propagates_fatal_error(self, monkeypatch):
-        monkeypatch.setattr(
-            medspa_scraper.requests,
-            'get',
-            lambda url, params=None, timeout=None: FakeResponse(
-                {'status': 'REQUEST_DENIED', 'error_message': 'The provided API key is invalid.'}
-            ),
-        )
+
+class TestLoadPlaceDetails:
+    async def test_calls_the_api_once_per_place_id(self, google, session):
+        cache = {}
+        semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
+
+        avoided = await load_place_details(session, 'key', ['place-1', 'place-1'], cache, semaphore)
+
+        assert google.details_requests == ['place-1']
+        assert avoided == 1
+        assert set(cache) == {'place-1'}
+
+    async def test_skips_place_ids_already_cached(self, google, session):
+        cache = {'place-1': {'website': 'https://cached.example.com'}}
+        semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
+
+        avoided = await load_place_details(session, 'key', ['place-1', 'place-2'], cache, semaphore)
+
+        assert google.details_requests == ['place-2']
+        assert avoided == 1
+        assert cache['place-1'] == {'website': 'https://cached.example.com'}
+
+    async def test_propagates_a_fatal_error(self, google, session):
+        google.details_payload = {'status': 'REQUEST_DENIED', 'error_message': 'invalid key'}
         with pytest.raises(FatalApiError):
-            get_place_details('bad-key', 'place-1')
+            await load_place_details(session, 'key', ['place-1'], {}, asyncio.Semaphore(2))
 
-    def test_reports_transport_error_and_returns_empty_dict(self, monkeypatch, capsys):
-        def boom(url, params=None, timeout=None):
-            raise RuntimeError('connection reset')
-
-        monkeypatch.setattr(medspa_scraper.requests, 'get', boom)
-        assert get_place_details('test-key', 'place-1') == {}
-        assert 'Place Details request failed for place-1' in capsys.readouterr().out
-
-
-class TestGetCachedPlaceDetails:
-    def test_calls_the_api_once_per_place_id(self, monkeypatch):
-        calls = []
-
-        def fake_get(url, params=None, timeout=None):
-            calls.append(params['place_id'])
-            return FakeResponse({'status': 'OK', 'result': {'website': 'https://glow.example.com'}})
-
-        monkeypatch.setattr(medspa_scraper.requests, 'get', fake_get)
+    async def test_recoverable_error_caches_an_empty_result(self, google, session):
+        google.details_payload = {'status': 'NOT_FOUND'}
         cache = {}
 
-        first = get_cached_place_details('test-key', 'place-1', cache)
-        second = get_cached_place_details('test-key', 'place-1', cache)
+        await load_place_details(session, 'key', ['place-1'], cache, asyncio.Semaphore(2))
+        await load_place_details(session, 'key', ['place-1'], cache, asyncio.Semaphore(2))
 
-        assert first == second == {'website': 'https://glow.example.com'}
-        assert calls == ['place-1']
+        assert cache == {'place-1': {}}
+        # The second pass is served from the cache rather than repeating a failing call
+        assert google.details_requests == ['place-1']
 
-    def test_keeps_separate_entries_per_place_id(self, monkeypatch):
-        calls = []
+    async def test_never_exceeds_the_concurrency_limit(self, google, session):
+        google.details_delay = 0.02
+        place_ids = [f'place-{i}' for i in range(MAX_CONCURRENT_REQUESTS * 3)]
 
-        def fake_get(url, params=None, timeout=None):
-            calls.append(params['place_id'])
-            return FakeResponse({'status': 'OK', 'result': {'website': f"https://{params['place_id']}.example.com"}})
+        await load_place_details(session, 'key', place_ids, {}, asyncio.Semaphore(MAX_CONCURRENT_REQUESTS))
 
-        monkeypatch.setattr(medspa_scraper.requests, 'get', fake_get)
-        cache = {}
-
-        assert get_cached_place_details('test-key', 'place-1', cache)['website'] == 'https://place-1.example.com'
-        assert get_cached_place_details('test-key', 'place-2', cache)['website'] == 'https://place-2.example.com'
-        assert calls == ['place-1', 'place-2']
-
-    def test_caches_empty_results_so_failures_are_not_retried(self, monkeypatch):
-        calls = []
-
-        def fake_get(url, params=None, timeout=None):
-            calls.append(params['place_id'])
-            return FakeResponse({'status': 'NOT_FOUND'})
-
-        monkeypatch.setattr(medspa_scraper.requests, 'get', fake_get)
-        cache = {}
-
-        assert get_cached_place_details('test-key', 'place-1', cache) == {}
-        assert get_cached_place_details('test-key', 'place-1', cache) == {}
-        assert calls == ['place-1']
-
-    def test_fatal_error_is_not_cached(self, monkeypatch):
-        monkeypatch.setattr(
-            medspa_scraper.requests,
-            'get',
-            lambda url, params=None, timeout=None: FakeResponse(
-                {'status': 'REQUEST_DENIED', 'error_message': 'invalid key'}
-            ),
-        )
-        cache = {}
-        with pytest.raises(FatalApiError):
-            get_cached_place_details('bad-key', 'place-1', cache)
-        assert cache == {}
+        assert len(google.details_requests) == len(place_ids)
+        assert google.peak_in_flight <= MAX_CONCURRENT_REQUESTS
+        # The requests really did overlap rather than running one at a time
+        assert google.peak_in_flight > 1
 
 
 class TestRunMedspaScraper:
-    async def test_prefers_details_over_search_payload(self, monkeypatch, no_email_lookup):
+    async def test_prefers_details_over_search_payload(self, google, no_email_lookup):
         no_email_lookup['https://glow.example.com'] = 'hello@glow.example.com'
-        stub_api(
-            monkeypatch,
-            {'status': 'OK', 'results': [place('Glow Med Spa')]},
-            {
-                'status': 'OK',
-                'result': {
-                    'formatted_address': 'Details address',
-                    'formatted_phone_number': '(310) 555-0100',
-                    'website': 'https://glow.example.com',
-                },
+        google.search_payload = {'status': 'OK', 'results': [place('Glow Med Spa')]}
+        google.details_payload = {
+            'status': 'OK',
+            'result': {
+                'formatted_address': '9 Rodeo Dr, Beverly Hills, CA 90212, USA',
+                'formatted_phone_number': '(310) 555-0100',
+                'website': 'https://glow.example.com',
             },
-        )
-        leads = await run_medspa_scraper('test-key', zip_code='90210', state='CA')
-        assert leads[0]['address'] == 'Details address'
+        }
+
+        leads = await run_medspa_scraper('key', zip_code='90210', state='CA')
+
+        assert leads[0]['address'] == '9 Rodeo Dr, Beverly Hills, CA 90212, USA'
         assert leads[0]['phone'] == '(310) 555-0100'
         assert leads[0]['email'] == 'hello@glow.example.com'
 
-    async def test_falls_back_to_search_address_when_details_are_empty(self, monkeypatch, no_email_lookup):
-        stub_api(monkeypatch, {'status': 'OK', 'results': [place('Glow Med Spa')]})
-        leads = await run_medspa_scraper('test-key')
-        assert leads[0]['address'] == 'Search address'
+    async def test_stores_the_business_zip_not_the_search_zip(self, google, no_email_lookup):
+        # A text search for 90210 also returns businesses in neighbouring zips
+        google.search_payload = {
+            'status': 'OK',
+            'results': [place('Nearby Spa', formatted_address='9 Rodeo Dr, Beverly Hills, CA 90212, USA')],
+        }
+
+        leads = await run_medspa_scraper('key', zip_code='90210', state='CA')
+
+        assert leads[0]['zip_code'] == '90212'
+
+    async def test_keeps_the_place_id_on_the_lead(self, google, no_email_lookup):
+        google.search_payload = {'status': 'OK', 'results': [place('Glow Med Spa')]}
+        leads = await run_medspa_scraper('key')
+        assert leads[0]['place_id'] == 'place-Glow Med Spa'
+
+    async def test_falls_back_to_search_address_when_details_are_empty(self, google, no_email_lookup):
+        google.search_payload = {'status': 'OK', 'results': [place('Glow Med Spa')]}
+        leads = await run_medspa_scraper('key')
+        assert leads[0]['address'] == '1 Main St, Beverly Hills, CA 90210, USA'
         assert leads[0]['phone'] == ''
         assert leads[0]['website'] == ''
         assert leads[0]['email'] == ''
 
-    async def test_skips_permanently_closed_businesses(self, monkeypatch, no_email_lookup):
-        stub_api(
-            monkeypatch,
-            {
-                'status': 'OK',
-                'results': [place('Open Spa'), place('Gone Spa', business_status='CLOSED_PERMANENTLY')],
-            },
-        )
-        leads = await run_medspa_scraper('test-key')
+    async def test_skips_permanently_closed_businesses(self, google, no_email_lookup):
+        google.search_payload = {
+            'status': 'OK',
+            'results': [place('Open Spa'), place('Gone Spa', business_status='CLOSED_PERMANENTLY')],
+        }
+
+        leads = await run_medspa_scraper('key')
+
         assert {item['business_name'] for item in leads} == {'Open Spa'}
+        # A closed business must not cost a details lookup either
+        assert google.details_requests == ['place-Open Spa']
 
-    async def test_searches_every_keyword(self, monkeypatch, no_email_lookup):
-        calls = stub_api(monkeypatch, {'status': 'OK', 'results': []})
-        await run_medspa_scraper('test-key', zip_code='90210', state='CA')
-        queries = [params['query'] for url, params in calls if url == SEARCH_URL]
-        assert queries == [f'{kw} in 90210, CA' for kw in KEYWORDS]
+    async def test_searches_every_keyword(self, google, no_email_lookup):
+        await run_medspa_scraper('key', zip_code='90210', state='CA')
+        assert google.search_queries == [f'{kw} in 90210, CA' for kw in KEYWORDS]
 
-    async def test_business_matching_every_keyword_is_billed_once(self, monkeypatch, no_email_lookup, capsys):
-        # Google returns the same business for several keywords, which used to mean paying per match
-        calls = stub_api(
-            monkeypatch,
-            {'status': 'OK', 'results': [place('Glow Med Spa')]},
-            {'status': 'OK', 'result': {'formatted_phone_number': '(310) 555-0100'}},
-        )
-        leads = await run_medspa_scraper('test-key')
+    async def test_business_matching_every_keyword_is_billed_once(self, google, no_email_lookup, capsys):
+        google.search_payload = {'status': 'OK', 'results': [place('Glow Med Spa')]}
+        google.details_payload = {'status': 'OK', 'result': {'formatted_phone_number': '(310) 555-0100'}}
 
-        details_calls = [params['place_id'] for url, params in calls if url == DETAILS_URL]
-        assert details_calls == ['place-Glow Med Spa']
-        # Every keyword still produces its own labelled lead, now from the cached details
+        leads = await run_medspa_scraper('key')
+
+        assert google.details_requests == ['place-Glow Med Spa']
         assert len(leads) == len(KEYWORDS)
         assert all(item['phone'] == '(310) 555-0100' for item in leads)
         assert f'1 unique businesses, {len(KEYWORDS) - 1} duplicate lookups avoided' in capsys.readouterr().out
 
-    async def test_distinct_businesses_are_each_looked_up(self, monkeypatch, no_email_lookup, capsys):
-        def fake_get(url, params=None, timeout=None):
-            if url == SEARCH_URL:
-                name = params['query'].split(' in ')[0]
-                return FakeResponse({'status': 'OK', 'results': [place(name)]})
-            return FakeResponse({'status': 'OK', 'result': {}})
+    async def test_rejected_key_aborts_and_carries_partial_results(self, google, no_email_lookup):
+        google.search_payload = {'status': 'REQUEST_DENIED', 'error_message': 'The provided API key is invalid.'}
 
-        monkeypatch.setattr(medspa_scraper.requests, 'get', fake_get)
-        await run_medspa_scraper('test-key')
-        assert f'{len(KEYWORDS)} unique businesses, 0 duplicate lookups avoided' in capsys.readouterr().out
+        with pytest.raises(FatalApiError) as excinfo:
+            await run_medspa_scraper('bad-key')
 
-    async def test_rejected_key_aborts_after_first_request(self, monkeypatch, no_email_lookup, capsys):
-        calls = stub_api(
-            monkeypatch,
-            {'status': 'REQUEST_DENIED', 'error_message': 'The provided API key is invalid.'},
-        )
-        leads = await run_medspa_scraper('bad-key')
-
-        out = capsys.readouterr().out
-        assert leads == []
-        assert 'REQUEST_DENIED' in out
-        assert 'Aborting search' in out
+        assert excinfo.value.partial_leads == []
         # The remaining keywords are skipped rather than repeating the same failure
-        assert len(calls) == 1
+        assert len(google.search_queries) == 1
 
-    async def test_details_quota_failure_aborts_the_run(self, monkeypatch, no_email_lookup, capsys):
-        calls = stub_api(
-            monkeypatch,
-            {'status': 'OK', 'results': [place('Glow Med Spa')]},
-            {'status': 'OVER_QUERY_LIMIT', 'error_message': 'Daily quota exceeded.'},
-        )
-        leads = await run_medspa_scraper('test-key')
+    async def test_partial_results_survive_a_mid_run_quota_failure(self, google, no_email_lookup):
+        google.search_payload = {'status': 'OK', 'results': [place('Glow Med Spa')]}
+        google.details_by_place_id['place-Glow Med Spa'] = {'status': 'OK', 'result': {}}
 
-        assert 'OVER_QUERY_LIMIT' in capsys.readouterr().out
+        original = medspa_scraper.fetch_api_json
+        seen = {'searches': 0}
+
+        async def failing_after_first_keyword(session, url, params, context):
+            if url == medspa_scraper.SEARCH_URL:
+                seen['searches'] += 1
+                if seen['searches'] == 2:
+                    raise FatalApiError('OVER_QUERY_LIMIT - quota exhausted')
+            return await original(session, url, params, context)
+
+        medspa_scraper.fetch_api_json = failing_after_first_keyword
+        try:
+            with pytest.raises(FatalApiError) as excinfo:
+                await run_medspa_scraper('key')
+        finally:
+            medspa_scraper.fetch_api_json = original
+
+        # Everything gathered before the quota ran out is still available to save
+        assert [item['business_name'] for item in excinfo.value.partial_leads] == ['Glow Med Spa']
+
+    async def test_recoverable_search_error_keeps_other_keywords_running(self, google, no_email_lookup, capsys):
+        google.search_payload = {'status': 'INVALID_REQUEST', 'error_message': 'bad query'}
+
+        leads = await run_medspa_scraper('key')
+
         assert leads == []
-        # One search plus one details call, then the run stops
-        assert len(calls) == 2
+        assert capsys.readouterr().out.count('INVALID_REQUEST') == len(KEYWORDS)
+        assert len(google.search_queries) == len(KEYWORDS)
 
-    async def test_recoverable_search_error_keeps_other_keywords_running(self, monkeypatch, no_email_lookup, capsys):
-        def fake_get(url, params=None, timeout=None):
-            if url == SEARCH_URL and params['query'].startswith('Med Spa'):
-                return FakeResponse({'status': 'INVALID_REQUEST', 'error_message': 'bad query'})
-            if url == SEARCH_URL:
-                return FakeResponse({'status': 'OK', 'results': [place('Glow Med Spa')]})
-            return FakeResponse({'status': 'OK', 'result': {}})
+    async def test_non_200_search_response_is_reported(self, google, no_email_lookup, capsys):
+        google.search_status = 503
 
-        monkeypatch.setattr(medspa_scraper.requests, 'get', fake_get)
-        leads = await run_medspa_scraper('test-key')
+        leads = await run_medspa_scraper('key')
 
-        assert 'INVALID_REQUEST' in capsys.readouterr().out
-        assert len(leads) == len(KEYWORDS) - 1
+        assert leads == []
+        assert capsys.readouterr().out.count('HTTP 503') == len(KEYWORDS)
 
 
 class TestSaveToSqlite:
     @pytest.fixture(autouse=True)
-    def database(self, tmp_path, monkeypatch):
+    def workdir(self, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
-        init_db()
 
-    def test_reports_when_there_is_nothing_to_save(self, capsys):
+    def test_creates_the_database_without_running_init_db_first(self, tmp_path):
+        save_to_sqlite([lead()])
+
+        assert (tmp_path / DB_PATH).is_file()
+        with sqlite3.connect(DB_PATH) as conn:
+            assert conn.execute('SELECT COUNT(*) FROM leads').fetchone()[0] == 1
+
+    def test_does_nothing_for_empty_input(self, tmp_path, capsys):
         save_to_sqlite([])
         assert 'No valid leads were scraped' in capsys.readouterr().out
+        assert not (tmp_path / DB_PATH).exists()
 
     def test_persists_all_lead_columns(self):
         save_to_sqlite([lead()])
         with sqlite3.connect(DB_PATH) as conn:
             row = conn.execute(
-                'SELECT business_name, industry, phone, website, email, state, zip_code, address, source FROM leads'
+                'SELECT business_name, industry, phone, website, email, state, zip_code, address, source, place_id '
+                'FROM leads'
             ).fetchone()
         assert row == (
             'Glow Med Spa',
@@ -357,26 +373,30 @@ class TestSaveToSqlite:
             '90210',
             '1 Main St',
             'Google_Places',
+            'place-Glow Med Spa',
         )
 
-    def test_reports_inserted_count_not_attempted_count(self, capsys):
-        save_to_sqlite([lead(), lead(industry='MedSpa/Esthetics (Facial Spa)')])
-
-        out = capsys.readouterr().out
-        assert 'Saved 1 new leads' in out
-        assert 'Fetched 2, skipped 1 already in the database' in out
+    def test_same_place_id_is_only_stored_once(self, capsys):
+        # The same business under two keywords, and now under two different zips
+        save_to_sqlite([lead(), lead(industry='MedSpa/Esthetics (Facial Spa)', zip_code='90212')])
 
         with sqlite3.connect(DB_PATH) as conn:
-            assert conn.execute('SELECT COUNT(*) FROM leads').fetchone()[0] == 1
+            rows = conn.execute('SELECT industry FROM leads').fetchall()
+        assert rows == [('MedSpa/Esthetics (Med Spa)',)]
+        assert 'Saved 1 new leads' in capsys.readouterr().out
 
-    def test_reports_honest_field_coverage(self, capsys):
-        save_to_sqlite(
-            [
-                lead(),
-                lead(business_name='Bare Spa', phone='', email='', address=''),
-            ]
-        )
-        assert 'Coverage of fetched leads: 1 with address, 1 with phone, 1 with email' in capsys.readouterr().out
+    def test_distinct_businesses_are_all_stored(self):
+        save_to_sqlite([lead(), lead(business_name='Other Spa', place_id='place-Other Spa')])
+        with sqlite3.connect(DB_PATH) as conn:
+            assert conn.execute('SELECT COUNT(*) FROM leads').fetchone()[0] == 2
+
+    def test_reports_inserted_count_and_coverage(self, capsys):
+        init_db()
+        save_to_sqlite([lead(), lead(business_name='Bare Spa', place_id='p2', phone='', email='', address='')])
+
+        out = capsys.readouterr().out
+        assert 'Saved 2 new leads' in out
+        assert 'Coverage of fetched leads: 1 with address, 1 with phone, 1 with email' in out
 
 
 def html_response(body):
@@ -399,17 +419,16 @@ class TestFetchEmailFromWebsite:
         app.router.add_get('/svg-only', html_response('<img src="icon@1x.svg">'))
         app.router.add_get('/jpeg-only', html_response('<img src="hero@2x.jpeg">'))
         app.router.add_get('/image-and-email', html_response('<img src="banner@3x.jpg">support@example.org'))
+        app.router.add_get(
+            '/many-emails',
+            html_response('first@example.com then second@example.com then third@example.com'),
+        )
         app.router.add_get('/not-found', not_found)
 
         server = TestServer(app)
         await server.start_server()
         yield server
         await server.close()
-
-    @pytest.fixture
-    async def session(self):
-        async with aiohttp.ClientSession() as client_session:
-            yield client_session
 
     @pytest.mark.parametrize('website_url', [None, '', 123, []])
     async def test_returns_empty_string_for_invalid_input(self, website_url):
@@ -418,6 +437,12 @@ class TestFetchEmailFromWebsite:
     async def test_extracts_email_from_html(self, session, website):
         url = str(website.make_url('/with-email'))
         assert await medspa_scraper.fetch_email_from_website(session, url) == 'sales@example.com'
+
+    async def test_returns_the_first_address_in_document_order(self, session, website):
+        # Deduplicating through a set used to make this vary between runs
+        url = str(website.make_url('/many-emails'))
+        results = {await medspa_scraper.fetch_email_from_website(session, url) for _ in range(5)}
+        assert results == {'first@example.com'}
 
     async def test_returns_empty_string_when_page_has_no_email(self, session, website):
         url = str(website.make_url('/without-email'))

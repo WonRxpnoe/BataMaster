@@ -19,6 +19,7 @@ EXPECTED_COLUMNS = [
     'source',
     'status',
     'website_live',
+    'place_id',
 ]
 
 LEGACY_SCHEMA = '''
@@ -135,6 +136,48 @@ def test_migration_is_safe_to_run_repeatedly():
     assert columns == EXPECTED_COLUMNS
     # A second run must not reset statuses that cleaning already assigned
     assert status == 'valid'
+
+
+def test_place_id_is_unique_across_rows():
+    init_db()
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            "INSERT INTO leads (business_name, zip_code, place_id) VALUES ('Glow Spa', '90210', 'place-1')"
+        )
+        with pytest.raises(sqlite3.IntegrityError):
+            # The same business found under a different keyword or search zip
+            conn.execute(
+                "INSERT INTO leads (business_name, zip_code, place_id) VALUES ('Glow Spa', '90212', 'place-1')"
+            )
+
+
+def test_rows_without_a_place_id_do_not_collide():
+    # Leads scraped before place_id was stored all carry NULL, which SQLite treats as distinct
+    init_db()
+    with sqlite3.connect(DB_PATH) as conn:
+        insert_lead(conn, 'Acme Plumbing', '78701')
+        insert_lead(conn, 'Beta Plumbing', '78702')
+        assert conn.execute('SELECT COUNT(*) FROM leads WHERE place_id IS NULL').fetchone()[0] == 2
+
+
+def test_migration_adds_the_place_id_index_to_a_legacy_database():
+    import os
+
+    os.makedirs('data', exist_ok=True)
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(LEGACY_SCHEMA)
+        conn.execute("INSERT INTO leads (business_name, zip_code) VALUES ('Acme Plumbing', '78701')")
+
+    init_db()
+
+    with sqlite3.connect(DB_PATH) as conn:
+        indexes = {row[1] for row in conn.execute('PRAGMA index_list(leads)')}
+        conn.execute("UPDATE leads SET place_id = 'place-1'")
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO leads (business_name, zip_code, place_id) VALUES ('Other', '78702', 'place-1')"
+            )
+    assert 'idx_leads_place_id' in indexes
 
 
 def test_null_zip_code_bypasses_unique_constraint():
