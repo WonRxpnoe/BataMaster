@@ -1,5 +1,4 @@
-pandas
-aiohttp
-beautifulsoup4
-requests
-dnspython
+aiohttp==3.13.5
+dnspython==2.7.0
+pandas==2.3.3
+requests==2.32.5

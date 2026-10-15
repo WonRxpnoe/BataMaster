@@ -41,8 +41,15 @@ async def pipeline(tmp_path, monkeypatch):
     monkeypatch.setattr(medspa_scraper, 'SEARCH_URL', f'{base}/textsearch/json')
     monkeypatch.setattr(medspa_scraper, 'DETAILS_URL', f'{base}/details/json')
 
-    # The cleaner reaches the mock websites over plain HTTP, but DNS has to be faked
-    monkeypatch.setattr(clean_leads.dns.resolver, 'resolve', lambda domain, record_type: [f'mx.{domain}'])
+    # The cleaner reaches the mock websites over plain HTTP, but DNS has to be faked.
+    # Only .invalid domains are treated as unresolvable, so at least one lead is
+    # genuinely rejected and the status filters have something to actually filter.
+    def fake_resolve(domain, record_type):
+        if domain.endswith('.invalid'):
+            raise clean_leads.dns.resolver.NXDOMAIN(domain)
+        return [f'mx.{domain}']
+
+    monkeypatch.setattr(clean_leads.dns.resolver, 'resolve', fake_resolve)
 
     yield tmp_path
     await server.close()
@@ -161,10 +168,37 @@ class TestFullPipeline:
         valid_leads = export_leads(output_path='data/valid.csv', status='valid')
         live_leads = export_leads(output_path='data/live.csv', status='valid', live_site_only=True)
 
-        # Every mock business is reachable, so nothing is filtered out by status
-        assert all_leads == valid_leads
+        # Bounce Aesthetics has no phone and an unresolvable email domain, so the
+        # cleaner rejects it and the default export leaves it behind
+        assert all_leads == valid_leads + 1
         # Serenity has no website at all, so it drops out of the live-site list
         assert live_leads == valid_leads - 1
+
+    async def test_a_rejected_lead_is_kept_but_never_exported(self, pipeline):
+        await scrape(['90210'])
+        await clean()
+        export_leads(output_path=CSV_PATH)
+
+        with sqlite3.connect(DB_PATH) as conn:
+            status = conn.execute(
+                'SELECT status FROM leads WHERE business_name = ?',
+                ('Bounce Aesthetics 90210',),
+            ).fetchone()
+
+        # Still on record, so the rejection can be reviewed rather than silently lost
+        assert status == ('invalid',)
+        assert 'Bounce Aesthetics 90210' not in set(pd.read_csv(CSV_PATH)['business_name'])
+
+    async def test_website_live_exports_as_an_integer(self, pipeline):
+        await scrape(['90210'])
+        await clean()
+        export_leads(output_path=CSV_PATH, status=None)
+
+        # Read as text to see exactly what was written rather than what pandas infers
+        written = pd.read_csv(CSV_PATH, dtype=str)['website_live'].dropna()
+
+        # A NULL from a business with no website must not turn the flags into 1.0
+        assert set(written) == {'1'}
 
     async def test_cleaning_twice_is_stable(self, pipeline):
         await scrape(['90210'])

@@ -70,6 +70,15 @@ class RetryableApiError(Exception):
     """Raised for failures that often succeed when the same request is repeated."""
 
 
+class RequestFailed(Exception):
+    """Raised when a request never completed, so its absence must not be read as an answer.
+
+    This is what separates "the API says there is nothing here" from "we never found
+    out", which decides both whether a result may be cached and whether a zip code can
+    be recorded as finished.
+    """
+
+
 class RateLimiter:
     """Spaces outgoing requests so a burst cannot trip the per-second API limits."""
 
@@ -132,13 +141,11 @@ async def fetch_api_json(session, url, params, context, limiter=None):
 
         if attempt == MAX_ATTEMPTS:
             logger.warning("%s failed after %s attempts: %s", context, MAX_ATTEMPTS, reason)
-            return None
+            raise RequestFailed(reason)
 
         backoff = RETRY_BACKOFF * (2 ** (attempt - 1))
         logger.debug("%s failed (%s), retrying in %.1fs", context, reason, backoff)
         await asyncio.sleep(backoff)
-
-    return None
 
 
 def extract_zip_code(address, fallback):
@@ -189,7 +196,10 @@ async def get_place_details(session, api_key, place_id, limiter=None):
 
 
 async def load_place_details(session, api_key, place_ids, cache, semaphore, limiter=None):
-    """Look up the places missing from the cache and report how many lookups it saved."""
+    """Look up the places missing from the cache.
+
+    Returns the number of lookups the cache saved and the number that never completed.
+    """
     missing = [place_id for place_id in dict.fromkeys(place_ids) if place_id not in cache]
 
     async def fetch(place_id):
@@ -199,9 +209,14 @@ async def load_place_details(session, api_key, place_ids, cache, semaphore, limi
     results = await asyncio.gather(*(fetch(place_id) for place_id in missing), return_exceptions=True)
 
     fatal = None
+    incomplete = 0
     for result in results:
         if isinstance(result, FatalApiError):
             fatal = fatal or result
+        elif isinstance(result, RequestFailed):
+            # Left out of the cache, so a later page or zip code can try again. Caching
+            # it would silently cost this business its phone number for the whole run.
+            incomplete += 1
         elif isinstance(result, BaseException):
             raise result
         else:
@@ -211,7 +226,7 @@ async def load_place_details(session, api_key, place_ids, cache, semaphore, limi
     if fatal:
         raise fatal
 
-    return len(place_ids) - len(missing)
+    return len(place_ids) - len(missing), incomplete
 
 
 async def search_keyword_pages(session, api_key, query, limiter=None):
@@ -221,8 +236,10 @@ async def search_keyword_pages(session, api_key, query, limiter=None):
     for page in range(1, MAX_PAGES_PER_KEYWORD + 1):
         context = f"Text Search for {query} (page {page})"
         data = await fetch_api_json(session, SEARCH_URL, params, context, limiter)
-        if not data:
-            return
+        if data is None:
+            # A text search has no definitive empty answer, since ZERO_RESULTS still
+            # arrives with an OK status, so a missing payload means the page was lost
+            raise RequestFailed(context)
 
         yield data.get('results', [])
 
@@ -235,45 +252,64 @@ async def search_keyword_pages(session, api_key, query, limiter=None):
 
 
 async def scrape_zip_code(session, api_key, zip_code, state, details_cache, semaphore, limiter=None):
-    """Collect every lead for one zip code, reusing the shared details cache."""
+    """Collect every lead for one zip code, reusing the shared details cache.
+
+    Returns the leads, the lookups the cache saved, and how many requests never
+    completed, so the caller can tell a quiet zip code apart from a broken one.
+    """
     leads = []
     avoided_lookups = 0
+    incomplete = 0
 
     for keyword in KEYWORDS:
         query = f"{keyword} in {zip_code}, {state}"
 
-        async for results in search_keyword_pages(session, api_key, query, limiter):
-            # Skip permanently closed businesses before paying for their details
-            places = [
-                place for place in results
-                if place.get('business_status') != 'CLOSED_PERMANENTLY'
-            ]
-            if not places:
-                continue
+        try:
+            async for results in search_keyword_pages(session, api_key, query, limiter):
+                # Skip permanently closed businesses before paying for their details
+                places = [
+                    place for place in results
+                    if place.get('business_status') != 'CLOSED_PERMANENTLY'
+                ]
+                if not places:
+                    continue
 
-            place_ids = [place.get('place_id') for place in places]
-            avoided_lookups += await load_place_details(
-                session, api_key, place_ids, details_cache, semaphore, limiter
-            )
+                place_ids = [place.get('place_id') for place in places]
+                avoided, missed = await load_place_details(
+                    session, api_key, place_ids, details_cache, semaphore, limiter
+                )
+                avoided_lookups += avoided
+                incomplete += missed
 
-            for place in places:
-                details = details_cache.get(place.get('place_id'), {})
-                address = details.get('formatted_address', place.get('formatted_address', ''))
+                leads.extend(build_leads(places, details_cache, keyword, zip_code, state))
+        except RequestFailed:
+            # One keyword going dark should not stop the rest from being searched
+            incomplete += 1
 
-                leads.append({
-                    "business_name": place.get('name'),
-                    "industry": f"MedSpa/Esthetics ({keyword})",
-                    "address": address,
-                    "phone": details.get('formatted_phone_number', ''),
-                    "website": details.get('website', ''),
-                    "email": "",
-                    "state": state,
-                    "zip_code": extract_zip_code(address, zip_code),
-                    "place_id": place.get('place_id'),
-                    "source": "Google_Places",
-                })
+    return leads, avoided_lookups, incomplete
 
-    return leads, avoided_lookups
+
+def build_leads(places, details_cache, keyword, zip_code, state):
+    """Merge each search result with its cached details into a lead record."""
+    leads = []
+    for place in places:
+        details = details_cache.get(place.get('place_id'), {})
+        address = details.get('formatted_address', place.get('formatted_address', ''))
+
+        leads.append({
+            "business_name": place.get('name'),
+            "industry": f"MedSpa/Esthetics ({keyword})",
+            "address": address,
+            "phone": details.get('formatted_phone_number', ''),
+            "website": details.get('website', ''),
+            "email": "",
+            "state": state,
+            "zip_code": extract_zip_code(address, zip_code),
+            "place_id": place.get('place_id'),
+            "source": "Google_Places",
+        })
+
+    return leads
 
 
 def recently_scraped_zip_codes(zip_codes, state, days):
@@ -323,13 +359,22 @@ async def run_medspa_scraper(api_key, zip_codes, state="CA", skip_recent_days=0)
         try:
             for zip_code in pending:
                 logger.info("Searching for businesses in zip code %s", zip_code)
-                leads, avoided = await scrape_zip_code(
+                leads, avoided, incomplete = await scrape_zip_code(
                     session, api_key, zip_code, state, details_cache, semaphore, limiter
                 )
                 all_leads.extend(leads)
                 avoided_lookups += avoided
-                record_scrape_run(zip_code, state, len(leads))
                 logger.info("Zip code %s produced %s leads", zip_code, len(leads))
+
+                if incomplete:
+                    # Recording it would let --skip-recent treat a broken run as finished
+                    logger.warning(
+                        "Zip code %s left %s requests unanswered and was not recorded as scraped",
+                        zip_code,
+                        incomplete,
+                    )
+                else:
+                    record_scrape_run(zip_code, state, len(leads))
         except FatalApiError as e:
             e.partial_leads = all_leads
             raise

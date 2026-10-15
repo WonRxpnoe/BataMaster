@@ -59,7 +59,8 @@ export PLACES_BASE_URL=http://127.0.0.1:8899 GOOGLE_API_KEY=mock-key
 
 Unset `PLACES_BASE_URL` to go back to the real API. The mock data deliberately
 includes a permanently closed business, one with no website, one whose site has no
-email, and one with no phone number.
+email, one with no phone number, and one that cannot be reached at all, so every
+branch the cleaner has to decide between appears at least once.
 
 ## Schema
 

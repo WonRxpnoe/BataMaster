@@ -289,22 +289,22 @@ class TestExtractZipCode:
 class TestLoadPlaceDetails:
     async def test_calls_the_api_once_per_place_id(self, google, session):
         cache = {}
-        avoided = await load_place_details(
+        avoided, incomplete = await load_place_details(
             session, 'key', ['place-1', 'place-1'], cache, asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
         )
 
         assert google.details_requests == ['place-1']
-        assert avoided == 1
+        assert (avoided, incomplete) == (1, 0)
         assert set(cache) == {'place-1'}
 
     async def test_skips_place_ids_already_cached(self, google, session):
         cache = {'place-1': {'website': 'https://cached.example.com'}}
-        avoided = await load_place_details(
+        avoided, incomplete = await load_place_details(
             session, 'key', ['place-1', 'place-2'], cache, asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
         )
 
         assert google.details_requests == ['place-2']
-        assert avoided == 1
+        assert (avoided, incomplete) == (1, 0)
         assert cache['place-1'] == {'website': 'https://cached.example.com'}
 
     async def test_propagates_a_fatal_error(self, google, session):
@@ -316,12 +316,26 @@ class TestLoadPlaceDetails:
         google.details_payload = {'status': 'NOT_FOUND'}
         cache = {}
 
-        await load_place_details(session, 'key', ['place-1'], cache, asyncio.Semaphore(2))
+        _, incomplete = await load_place_details(session, 'key', ['place-1'], cache, asyncio.Semaphore(2))
         await load_place_details(session, 'key', ['place-1'], cache, asyncio.Semaphore(2))
 
         assert cache == {'place-1': {}}
+        # The API gave a definitive answer, so this is not an unfinished request
+        assert incomplete == 0
         # The second pass is served from the cache rather than repeating a failing call
         assert google.details_requests == ['place-1']
+
+    async def test_an_unfinished_lookup_is_not_cached(self, google, session):
+        google.details_status = 503
+        cache = {}
+
+        _, incomplete = await load_place_details(session, 'key', ['place-1'], cache, asyncio.Semaphore(2))
+
+        # Caching this would cost the business its phone number for the entire run,
+        # so the place id is left absent and a later page can ask again
+        assert cache == {}
+        assert incomplete == 1
+        assert google.details_requests == ['place-1'] * medspa_scraper.MAX_ATTEMPTS
 
     async def test_never_exceeds_the_concurrency_limit(self, google, session):
         google.details_delay = 0.02
@@ -453,6 +467,54 @@ class TestMultipleZipCodes:
         with sqlite3.connect(DB_PATH) as conn:
             rows = conn.execute('SELECT zip_code, state, leads_found FROM scrape_runs ORDER BY zip_code').fetchall()
         assert rows == [('90210', 'CA', 1), ('90211', 'CA', 1)]
+
+    async def test_an_unanswered_zip_is_not_recorded_as_scraped(
+        self, google, no_email_lookup, single_keyword, capture_logs
+    ):
+        init_db()
+        # Every attempt fails, so this zip produced nothing because it broke
+        google.search_failures = 99
+
+        await run_medspa_scraper('key', ['90210'], state='CA')
+
+        with sqlite3.connect(DB_PATH) as conn:
+            assert conn.execute('SELECT COUNT(*) FROM scrape_runs').fetchone()[0] == 0
+        assert 'was not recorded as scraped' in capture_logs.text
+
+    async def test_a_zip_that_failed_is_retried_rather_than_skipped(
+        self, google, no_email_lookup, single_keyword
+    ):
+        init_db()
+        google.search_failures = 99
+        await run_medspa_scraper('key', ['90210'], state='CA')
+
+        # The whole point of not recording it: the next run must pick it up again
+        assert recently_scraped_zip_codes(['90210'], 'CA', 7) == set()
+
+    async def test_a_genuinely_empty_zip_is_still_recorded(self, google, no_email_lookup, single_keyword):
+        init_db()
+        google.search_payload = {'status': 'ZERO_RESULTS', 'results': []}
+
+        await run_medspa_scraper('key', ['90210'], state='CA')
+
+        # Nothing failed, so an area with no med spas counts as finished
+        with sqlite3.connect(DB_PATH) as conn:
+            assert conn.execute('SELECT zip_code, leads_found FROM scrape_runs').fetchall() == [('90210', 0)]
+
+    async def test_an_unfinished_details_lookup_also_blocks_the_record(
+        self, google, no_email_lookup, single_keyword
+    ):
+        init_db()
+        # The search works, but the details call behind it never completes
+        google.search_payload = {'status': 'OK', 'results': [place('Glow Med Spa')]}
+        google.details_status = 503
+
+        leads = await run_medspa_scraper('key', ['90210'], state='CA')
+
+        # The lead is still returned, just without a phone number worth trusting
+        assert len(leads) == 1
+        with sqlite3.connect(DB_PATH) as conn:
+            assert conn.execute('SELECT COUNT(*) FROM scrape_runs').fetchone()[0] == 0
 
     async def test_a_fatal_error_leaves_the_unfinished_zip_unrecorded(self, google, no_email_lookup, single_keyword):
         init_db()

@@ -105,8 +105,11 @@ def clean_and_validate_leads(only_new=False):
             "UPDATE leads SET status = ?, website_live = ? WHERE id = ?",
             (status, website_live, lead_id),
         )
+        # Commit per lead rather than once at the end. A single transaction would hold
+        # the write lock across every DNS and HTTP call, locking the scraper out for the
+        # whole run and losing all progress if the process stopped partway through.
+        conn.commit()
 
-    conn.commit()
     conn.close()
 
     logger.info("Marked %s valid and %s invalid, nothing was deleted", valid_count, invalid_count)

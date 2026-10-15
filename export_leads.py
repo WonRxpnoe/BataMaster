@@ -54,6 +54,10 @@ def export_leads(output_path=DEFAULT_OUTPUT, status='valid', live_site_only=Fals
     with sqlite3.connect(DB_PATH) as conn:
         frame = pd.read_sql_query(query, conn, params=params)
 
+    # Businesses with no website leave this NULL, which would otherwise widen the whole
+    # column to float and write every flag as 1.0
+    frame['website_live'] = frame['website_live'].astype('Int64')
+
     directory = os.path.dirname(output_path)
     if directory:
         os.makedirs(directory, exist_ok=True)

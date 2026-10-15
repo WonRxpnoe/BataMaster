@@ -22,13 +22,16 @@ DEFAULT_PORT = 8899
 
 PAGE_SIZE = 2
 
-# One template per situation the pipeline has to cope with
+# One template per situation the pipeline has to cope with. Addresses on a .invalid
+# domain are meant to have no MX records, which is how a lead ends up rejected.
 BUSINESS_TEMPLATES = [
     {'slug': 'glow', 'name': 'Glow Med Spa', 'has_site': True, 'email': 'hello@glow-spa.example'},
     {'slug': 'radiance', 'name': 'Radiance Skin Clinic', 'has_site': True, 'email': None},
     {'slug': 'serenity', 'name': 'Serenity Facial Bar', 'has_site': False, 'email': None},
     {'slug': 'closed', 'name': 'Closed Aesthetics', 'has_site': True, 'email': None, 'closed': True},
     {'slug': 'nophone', 'name': 'Quiet Esthetics', 'has_site': True, 'email': 'book@quiet.example', 'phone': None},
+    {'slug': 'bounce', 'name': 'Bounce Aesthetics', 'has_site': True, 'phone': None,
+     'email': 'owner@bounce.invalid'},
 ]
 
 
