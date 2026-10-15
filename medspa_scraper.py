@@ -360,6 +360,14 @@ async def run_medspa_scraper(
 ):
     """Scrape every requested zip code, then fill in emails from the business websites."""
     zip_codes = [str(zip_code) for zip_code in zip_codes]
+
+    # A deliberately cheap run covers a fraction of the area, so it must not leave
+    # behind a record that makes --skip-recent treat the zip code as finished
+    narrowed = (
+        (keywords is not None and list(keywords) != list(KEYWORDS))
+        or (max_pages is not None and max_pages < MAX_PAGES_PER_KEYWORD)
+    )
+
     skipped = recently_scraped_zip_codes(zip_codes, state, skip_recent_days)
     for zip_code in zip_codes:
         if zip_code in skipped:
@@ -394,6 +402,12 @@ async def run_medspa_scraper(
                         "Zip code %s left %s requests unanswered and was not recorded as scraped",
                         zip_code,
                         incomplete,
+                    )
+                elif narrowed:
+                    logger.info(
+                        "Zip code %s was searched with narrowed settings, "
+                        "so it is left open for a full run",
+                        zip_code,
                     )
                 else:
                     record_scrape_run(zip_code, state, len(leads))

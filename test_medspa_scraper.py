@@ -488,6 +488,46 @@ class TestCostGuards:
 
         assert len(google.search_queries) == 1
 
+    async def test_a_narrowed_run_is_not_recorded_as_a_finished_zip(self, google, no_email_lookup):
+        init_db()
+        google.search_payload = {'status': 'OK', 'results': [place('Glow Med Spa')]}
+
+        await run_medspa_scraper('key', ['90210'], 'CA', keywords=['Med Spa'], max_pages=1)
+
+        # A cheap probe covers a fraction of the area, so the full run must still happen
+        assert recently_scraped_zip_codes(['90210'], 'CA', 7) == set()
+
+    @pytest.mark.parametrize(
+        'kwargs',
+        [
+            {'keywords': ['Med Spa']},
+            {'max_pages': 1},
+            {'keywords': ['Med Spa', 'Facial Spa'], 'max_pages': 2},
+        ],
+    )
+    async def test_either_cap_on_its_own_leaves_the_zip_open(
+        self, google, no_email_lookup, kwargs
+    ):
+        init_db()
+        google.search_payload = {'status': 'OK', 'results': [place('Glow Med Spa')]}
+
+        await run_medspa_scraper('key', ['90210'], 'CA', **kwargs)
+
+        assert recently_scraped_zip_codes(['90210'], 'CA', 7) == set()
+
+    async def test_asking_for_every_keyword_still_counts_as_a_full_run(
+        self, google, no_email_lookup
+    ):
+        init_db()
+        google.search_payload = {'status': 'OK', 'results': [place('Glow Med Spa')]}
+
+        # Spelling out the defaults is not a narrowing
+        await run_medspa_scraper(
+            'key', ['90210'], 'CA', keywords=list(KEYWORDS), max_pages=MAX_PAGES_PER_KEYWORD
+        )
+
+        assert recently_scraped_zip_codes(['90210'], 'CA', 7) == {'90210'}
+
     async def test_the_billable_tally_counts_unique_businesses_not_results(
         self, google, no_email_lookup, capture_logs
     ):
