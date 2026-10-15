@@ -438,6 +438,35 @@ class TestRunMedspaScraper:
         assert len(google.search_queries) == len(KEYWORDS)
 
 
+class TestCostGuards:
+    async def test_searching_one_keyword_costs_one_search(self, google, no_email_lookup, capture_logs):
+        google.search_payload = {'status': 'OK', 'results': [place('Glow Med Spa')]}
+
+        await run_medspa_scraper('key', ['90210'], keywords=['Med Spa'])
+
+        assert google.search_queries == ['Med Spa in 90210, CA']
+        assert 'Billable requests: 1 Text Search, 1 Place Details' in capture_logs.text
+
+    async def test_max_pages_stops_the_scraper_following_the_token(self, google, no_email_lookup, single_keyword):
+        # The payload always offers another page, so only the limit can end this
+        google.search_payload = {'status': 'OK', 'results': [place('Endless')], 'next_page_token': 'more'}
+
+        await run_medspa_scraper('key', ['90210'], max_pages=1)
+
+        assert len(google.search_queries) == 1
+
+    async def test_the_billable_tally_counts_unique_businesses_not_results(
+        self, google, no_email_lookup, capture_logs
+    ):
+        # One business surfacing under all five keywords is five searches but one lookup
+        google.search_payload = {'status': 'OK', 'results': [place('Glow Med Spa')]}
+
+        await run_medspa_scraper('key', ['90210'])
+
+        expected = f'Billable requests: {len(KEYWORDS)} Text Search, 1 Place Details'
+        assert expected in capture_logs.text
+
+
 class TestMultipleZipCodes:
     async def test_scrapes_every_requested_zip_code(self, google, no_email_lookup, single_keyword):
         google.search_payload = {'status': 'OK', 'results': [place('Glow Med Spa')]}
@@ -651,6 +680,19 @@ class TestCommandLine:
         assert args.state == 'CA'
         assert args.skip_recent == 0
         assert args.verbose is False
+        # No cost limits by default, so an unflagged run behaves as it always has
+        assert args.keywords is None
+        assert args.max_pages == MAX_PAGES_PER_KEYWORD
+
+    def test_accepts_a_narrowed_search(self):
+        args = parse_args(['--zip', '90210', '--keywords', 'Med Spa', 'Facial Spa', '--max-pages', '1'])
+        assert args.keywords == ['Med Spa', 'Facial Spa']
+        assert args.max_pages == 1
+
+    @pytest.mark.parametrize('pages', ['0', '-1', str(MAX_PAGES_PER_KEYWORD + 1)])
+    def test_rejects_a_page_count_the_api_cannot_serve(self, pages):
+        with pytest.raises(SystemExit):
+            parse_args(['--zip', '90210', '--max-pages', pages])
 
     def test_exits_non_zero_without_an_api_key(self, monkeypatch, tmp_path):
         monkeypatch.chdir(tmp_path)
@@ -666,8 +708,10 @@ class TestCommandLine:
         monkeypatch.chdir(tmp_path)
         monkeypatch.setenv('GOOGLE_API_KEY', 'real-key')
 
-        async def fake_run(api_key, zip_codes, state, skip_recent_days):
+        async def fake_run(api_key, zip_codes, state, skip_recent_days, keywords, max_pages):
             assert (api_key, zip_codes, state, skip_recent_days) == ('real-key', ['90210'], 'CA', 0)
+            # No --keywords means every default term, and the full page allowance
+            assert (keywords, max_pages) == (None, MAX_PAGES_PER_KEYWORD)
             return [lead()]
 
         monkeypatch.setattr(medspa_scraper, 'run_medspa_scraper', fake_run)
@@ -680,7 +724,7 @@ class TestCommandLine:
         monkeypatch.chdir(tmp_path)
         monkeypatch.setenv('GOOGLE_API_KEY', 'real-key')
 
-        async def fake_run(api_key, zip_codes, state, skip_recent_days):
+        async def fake_run(api_key, zip_codes, state, skip_recent_days, keywords, max_pages):
             raise FatalApiError('OVER_QUERY_LIMIT - quota exhausted', partial_leads=[lead()])
 
         monkeypatch.setattr(medspa_scraper, 'run_medspa_scraper', fake_run)

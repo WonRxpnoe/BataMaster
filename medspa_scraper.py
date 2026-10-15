@@ -6,6 +6,7 @@ import re
 import sqlite3
 import sys
 from datetime import datetime, timedelta, timezone
+from typing import NamedTuple
 
 import aiohttp
 
@@ -232,11 +233,12 @@ async def load_place_details(session, api_key, place_ids, cache, semaphore, limi
     return len(place_ids) - len(missing), incomplete
 
 
-async def search_keyword_pages(session, api_key, query, limiter=None):
+async def search_keyword_pages(session, api_key, query, limiter=None, max_pages=None):
     """Yield each page of text search results, following next_page_token."""
     params = {'query': query, 'key': api_key}
+    max_pages = MAX_PAGES_PER_KEYWORD if max_pages is None else max_pages
 
-    for page in range(1, MAX_PAGES_PER_KEYWORD + 1):
+    for page in range(1, max_pages + 1):
         context = f"Text Search for {query} (page {page})"
         data = await fetch_api_json(session, SEARCH_URL, params, context, limiter)
         if data is None:
@@ -254,21 +256,32 @@ async def search_keyword_pages(session, api_key, query, limiter=None):
         params = {'pagetoken': token, 'key': api_key}
 
 
-async def scrape_zip_code(session, api_key, zip_code, state, details_cache, semaphore, limiter=None):
-    """Collect every lead for one zip code, reusing the shared details cache.
+class ZipResult(NamedTuple):
+    """What one zip code produced, and what it cost to find out."""
 
-    Returns the leads, the lookups the cache saved, and how many requests never
-    completed, so the caller can tell a quiet zip code apart from a broken one.
-    """
+    leads: list
+    avoided_lookups: int
+    incomplete: int
+    searches: int
+
+
+async def scrape_zip_code(
+    session, api_key, zip_code, state, details_cache, semaphore,
+    limiter=None, keywords=None, max_pages=None,
+):
+    """Collect every lead for one zip code, reusing the shared details cache."""
     leads = []
     avoided_lookups = 0
     incomplete = 0
+    searches = 0
 
-    for keyword in KEYWORDS:
+    for keyword in keywords or KEYWORDS:
         query = f"{keyword} in {zip_code}, {state}"
 
         try:
-            async for results in search_keyword_pages(session, api_key, query, limiter):
+            async for results in search_keyword_pages(session, api_key, query, limiter, max_pages):
+                searches += 1
+
                 # Skip permanently closed businesses before paying for their details
                 places = [
                     place for place in results
@@ -289,7 +302,7 @@ async def scrape_zip_code(session, api_key, zip_code, state, details_cache, sema
             # One keyword going dark should not stop the rest from being searched
             incomplete += 1
 
-    return leads, avoided_lookups, incomplete
+    return ZipResult(leads, avoided_lookups, incomplete, searches)
 
 
 def build_leads(places, details_cache, keyword, zip_code, state):
@@ -342,7 +355,9 @@ def record_scrape_run(zip_code, state, leads_found):
         )
 
 
-async def run_medspa_scraper(api_key, zip_codes, state="CA", skip_recent_days=0):
+async def run_medspa_scraper(
+    api_key, zip_codes, state="CA", skip_recent_days=0, keywords=None, max_pages=None,
+):
     """Scrape every requested zip code, then fill in emails from the business websites."""
     zip_codes = [str(zip_code) for zip_code in zip_codes]
     skipped = recently_scraped_zip_codes(zip_codes, state, skip_recent_days)
@@ -355,6 +370,7 @@ async def run_medspa_scraper(api_key, zip_codes, state="CA", skip_recent_days=0)
     all_leads = []
     details_cache = {}
     avoided_lookups = 0
+    searches = 0
     semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
     limiter = RateLimiter(MIN_SECONDS_BETWEEN_REQUESTS)
 
@@ -362,11 +378,14 @@ async def run_medspa_scraper(api_key, zip_codes, state="CA", skip_recent_days=0)
         try:
             for zip_code in pending:
                 logger.info("Searching for businesses in zip code %s", zip_code)
-                leads, avoided, incomplete = await scrape_zip_code(
-                    session, api_key, zip_code, state, details_cache, semaphore, limiter
+                result = await scrape_zip_code(
+                    session, api_key, zip_code, state, details_cache, semaphore,
+                    limiter, keywords, max_pages,
                 )
+                leads, incomplete = result.leads, result.incomplete
                 all_leads.extend(leads)
-                avoided_lookups += avoided
+                avoided_lookups += result.avoided_lookups
+                searches += result.searches
                 logger.info("Zip code %s produced %s leads", zip_code, len(leads))
 
                 if incomplete:
@@ -386,6 +405,12 @@ async def run_medspa_scraper(api_key, zip_codes, state="CA", skip_recent_days=0)
             "Place Details: %s unique businesses, %s duplicate lookups avoided",
             len(details_cache),
             avoided_lookups,
+        )
+        # The two numbers Google bills for, so a run can be priced against its quota
+        logger.info(
+            "Billable requests: %s Text Search, %s Place Details",
+            searches,
+            len(details_cache),
         )
 
         logger.info("Visiting %s business websites to extract emails", len(all_leads))
@@ -451,8 +476,20 @@ def parse_args(argv=None):
         '--skip-recent', type=int, default=0, metavar='DAYS',
         help='Skip zip codes already scraped within this many days',
     )
+    parser.add_argument(
+        '--keywords', nargs='+', default=None, metavar='TERM',
+        help=f'Search terms to use instead of all {len(KEYWORDS)} defaults',
+    )
+    parser.add_argument(
+        '--max-pages', type=int, default=MAX_PAGES_PER_KEYWORD, metavar='N',
+        help=f'Result pages per keyword, each worth 20 results (default: {MAX_PAGES_PER_KEYWORD})',
+    )
     parser.add_argument('--verbose', action='store_true', help='Show debug level logging')
-    return parser.parse_args(argv)
+
+    args = parser.parse_args(argv)
+    if not 1 <= args.max_pages <= MAX_PAGES_PER_KEYWORD:
+        parser.error(f'--max-pages must be between 1 and {MAX_PAGES_PER_KEYWORD}')
+    return args
 
 
 def main(argv=None):
@@ -467,9 +504,10 @@ def main(argv=None):
         return 1
 
     try:
-        leads = asyncio.run(
-            run_medspa_scraper(api_key, args.zip_codes, args.state, args.skip_recent)
-        )
+        leads = asyncio.run(run_medspa_scraper(
+            api_key, args.zip_codes, args.state, args.skip_recent,
+            args.keywords, args.max_pages,
+        ))
     except FatalApiError as e:
         logger.error("Aborting search: %s", e)
         logger.error("Check your API key, billing status, and quota.")

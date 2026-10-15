@@ -25,6 +25,18 @@ fetches phone and website details, then visits each site to extract an email.
 .venv/bin/python medspa_scraper.py --zip 90210 --skip-recent 7   # skip recent work
 ```
 
+Every run ends with a `Billable requests` line counting the Text Search and Place
+Details calls it made, which are the two things Google charges for. `--keywords` and
+`--max-pages` cap that spend, which matters most on the first run against a new area
+where the number of businesses is unknown:
+
+```bash
+.venv/bin/python medspa_scraper.py --zip 90210 --keywords "Med Spa" --max-pages 1
+```
+
+That is one search returning at most twenty businesses, so the worst case is twenty
+details lookups. Widen it once the real density of the area is known.
+
 **2. Clean.** Checks that the phone number is complete, that the email domain has MX
 records, and whether the website still answers. Results are written to the `status`
 and `website_live` columns. Nothing is ever deleted.
