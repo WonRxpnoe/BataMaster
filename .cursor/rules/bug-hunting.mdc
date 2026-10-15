@@ -9,6 +9,18 @@ The owner is not an engineer and describes goals as business outcomes. Translate
 those into technical checks. Never ask the owner to supply a failure scenario, a
 file to inspect, or a test to write.
 
+## Never invent a field
+
+A contact detail is only ever recorded when it was read from the source. Never derive
+one from a pattern, as the tools that compose `first.last@company.com` from a name and
+a domain do: an address that looks right and bounces costs more than a blank field,
+and it cannot be told apart from a real one by looking at the list.
+
+The same holds for every other column. If Google's address carries no ZIP, the ZIP
+stays empty rather than inheriting the one that was searched for. When a detail cannot
+be found, the honest move is to leave it blank and widen the search, for instance by
+following a contact link the site itself publishes.
+
 ## Evidence, not opinion
 
 - Prove a bug with a script that runs and prints the wrong result, before fixing it.

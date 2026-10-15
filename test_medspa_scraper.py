@@ -292,11 +292,12 @@ class TestExtractZipCode:
         ],
     )
     def test_reads_the_zip_that_follows_the_state_code(self, address, expected):
-        assert extract_zip_code(address, '00000') == expected
+        assert extract_zip_code(address) == expected
 
     @pytest.mark.parametrize('address', [None, '', 'Somewhere in France'])
-    def test_falls_back_to_the_search_zip(self, address):
-        assert extract_zip_code(address, 90210) == '90210'
+    def test_leaves_the_zip_blank_when_the_address_does_not_state_one(self, address):
+        # Recording the ZIP that was searched for would pass a guess off as a fact
+        assert extract_zip_code(address) == ''
 
 
 class TestLoadPlaceDetails:
@@ -1037,6 +1038,39 @@ class TestFetchEmailFromWebsite:
         yield server
         await server.close()
 
+    @pytest.fixture
+    async def site(self):
+        """A business site that records which of its pages were read."""
+        pages = {
+            '/': '<a href="/services">Services</a><a href="/contact-us">Contact Us</a>',
+            '/contact-us': '<p>Reach the owner at owner@glow-spa.example</p>',
+            '/services': '<p>Facials and peels</p>',
+            '/home-has-it': '<p>front@glow-spa.example</p><a href="/contact-us">Contact</a>',
+            '/offsite': '<a href="https://elsewhere.example/contact">Our booking partner</a>',
+            '/deep': ('<a href="/a/contact">A</a><a href="/b/about">B</a>'
+                      '<a href="/c/reach">C</a>'),
+            '/a/contact': '<p>Nothing here</p>',
+            '/b/about': '<p>Nothing here either</p>',
+            '/c/reach': '<p>third@glow-spa.example</p>',
+            '/broken-first': '<a href="/gone/contact">A</a><a href="/b2/contact">B</a>',
+            '/b2/contact': '<p>second@glow-spa.example</p>',
+        }
+        visited = []
+
+        async def handler(request):
+            visited.append(request.path)
+            body = pages.get(request.path)
+            if body is None:
+                return web.Response(text='gone', status=404, content_type='text/html')
+            return web.Response(text=body, content_type='text/html')
+
+        app = web.Application()
+        app.router.add_get('/{tail:.*}', handler)
+        server = TestServer(app)
+        await server.start_server()
+        yield server, visited
+        await server.close()
+
     @pytest.mark.parametrize('website_url', [None, '', 123, []])
     async def test_returns_empty_string_for_invalid_input(self, website_url):
         assert await medspa_scraper.fetch_email_from_website(None, website_url) == ''
@@ -1074,6 +1108,41 @@ class TestFetchEmailFromWebsite:
 
     async def test_returns_empty_string_when_host_is_unreachable(self, session):
         assert await medspa_scraper.fetch_email_from_website(session, 'http://127.0.0.1:1/') == ''
+
+    async def test_follows_a_contact_link_when_the_homepage_has_nothing(self, session, site):
+        server, visited = site
+        got = await medspa_scraper.fetch_email_from_website(session, str(server.make_url('/')))
+
+        assert got == 'owner@glow-spa.example'
+        assert visited == ['/', '/contact-us']
+
+    async def test_reads_no_extra_page_when_the_homepage_has_the_address(self, session, site):
+        server, visited = site
+        url = str(server.make_url('/home-has-it'))
+
+        assert await medspa_scraper.fetch_email_from_website(session, url) == 'front@glow-spa.example'
+        assert visited == ['/home-has-it']
+
+    async def test_never_leaves_the_businesss_own_domain(self, session, site):
+        server, visited = site
+        url = str(server.make_url('/offsite'))
+
+        assert await medspa_scraper.fetch_email_from_website(session, url) == ''
+        assert visited == ['/offsite']
+
+    async def test_gives_up_rather_than_walking_the_whole_site(self, session, site):
+        server, visited = site
+        url = str(server.make_url('/deep'))
+
+        assert await medspa_scraper.fetch_email_from_website(session, url) == ''
+        assert visited == ['/deep', '/a/contact', '/b/about']
+
+    async def test_a_contact_page_that_fails_does_not_stop_the_next_one(self, session, site):
+        server, visited = site
+        url = str(server.make_url('/broken-first'))
+
+        got = await medspa_scraper.fetch_email_from_website(session, url)
+        assert got == 'second@glow-spa.example'
 
     async def test_prepends_https_scheme_for_bare_host(self, session):
         # No scheme means the helper retries against https://, which cannot resolve here

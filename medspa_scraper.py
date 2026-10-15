@@ -8,7 +8,7 @@ import sqlite3
 import sys
 from datetime import datetime, timedelta, timezone
 from typing import NamedTuple
-from urllib.parse import unquote, urlsplit
+from urllib.parse import unquote, urljoin, urlsplit
 
 import aiohttp
 
@@ -61,6 +61,14 @@ NON_BUSINESS_DOMAINS = {
 
 # Asset filenames routinely contain an @, as in logo@2x.png
 ASSET_SUFFIXES = ('.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg', '.avif', '.ico', '.bmp')
+
+LINK_PATTERN = re.compile(r'<a\b[^>]*?href=["\']([^"\']+)["\']', re.IGNORECASE)
+
+# Where a business that kept its address off the homepage tends to have put it
+CONTACT_PATH_WORDS = ('contact', 'about', 'reach', 'get-in-touch', 'book')
+
+# Enough to reach a contact page without walking a whole site for one address
+MAX_CONTACT_PAGES = 2
 
 # US addresses put the ZIP straight after the two-letter state code, as in "Beverly Hills, CA 90210"
 ZIP_FROM_ADDRESS = re.compile(r'\b[A-Z]{2}\s+(\d{5})(?:-\d{4})?\b')
@@ -180,10 +188,15 @@ async def fetch_api_json(session, url, params, context, limiter=None):
         await asyncio.sleep(backoff)
 
 
-def extract_zip_code(address, fallback):
-    """Prefer the ZIP from the business address; a text search also returns nearby areas."""
+def extract_zip_code(address):
+    """Read the ZIP out of the business address, or return an empty string.
+
+    A text search also returns businesses in neighbouring areas, so the ZIP searched
+    for is not this business's ZIP. Filling it in from the search would record a guess
+    as though it had been observed, and a blank field is honest about what is known.
+    """
     match = ZIP_FROM_ADDRESS.search(address or '')
-    return match.group(1) if match else str(fallback)
+    return match.group(1) if match else ''
 
 
 def site_domain(website_url):
@@ -231,6 +244,39 @@ def extract_email(html_text, website_url):
     return max(usable, key=confidence)
 
 
+def contact_page_links(html_text, website_url):
+    """Pages the site itself points at where contact details are usually printed.
+
+    Following a link the business published is not the same as guessing at a URL, and
+    it is the only honest way to reach an address that is simply not on the homepage.
+    """
+    host = urlsplit(website_url).hostname
+    links = []
+    for href in LINK_PATTERN.findall(html_text):
+        target = urljoin(website_url, html.unescape(href.strip()))
+        parts = urlsplit(target)
+        # Leaving the business's own domain would start reading somebody else's site
+        if parts.hostname != host or parts.scheme not in ('http', 'https'):
+            continue
+        if not any(word in parts.path.lower() for word in CONTACT_PATH_WORDS):
+            continue
+        clean = parts._replace(fragment='').geturl()
+        if clean not in links and clean != website_url:
+            links.append(clean)
+        if len(links) == MAX_CONTACT_PAGES:
+            break
+    return links
+
+
+async def fetch_page(session, url):
+    """Return the page body, or an empty string if the site did not serve it."""
+    # Certificates go unverified on purpose, since small business sites let them lapse
+    # constantly and only a public email is read off the page. clean_leads falls back to
+    # the same leniency so both stages agree a site is reachable.
+    async with session.get(url, timeout=REQUEST_TIMEOUT, ssl=False) as response:
+        return await response.text() if response.status == 200 else ''
+
+
 async def fetch_email_from_website(session, website_url):
     """Scrape an email address from a business website."""
     if not website_url or not isinstance(website_url, str):
@@ -239,14 +285,24 @@ async def fetch_email_from_website(session, website_url):
         website_url = 'https://' + website_url
 
     try:
-        # Certificates go unverified on purpose, since small business sites let them
-        # lapse constantly and only a public email is read off the page. clean_leads
-        # falls back to the same leniency so both stages agree a site is reachable.
-        async with session.get(website_url, timeout=REQUEST_TIMEOUT, ssl=False) as response:
-            if response.status == 200:
-                return extract_email(await response.text(), website_url)
+        homepage = await fetch_page(session, website_url)
     except Exception:
-        pass
+        return ""
+
+    email = extract_email(homepage, website_url)
+    if email:
+        return email
+
+    # Plenty of businesses print their address only on a contact page
+    for link in contact_page_links(homepage, website_url):
+        try:
+            page = await fetch_page(session, link)
+        except Exception:
+            continue
+        # The homepage URL still decides which domain counts as the business's own
+        email = extract_email(page, website_url)
+        if email:
+            return email
     return ""
 
 
@@ -387,7 +443,7 @@ def build_leads(places, details_cache, keyword, zip_code, state):
             "website": details.get('website', ''),
             "email": "",
             "state": state,
-            "zip_code": extract_zip_code(address, zip_code),
+            "zip_code": extract_zip_code(address),
             "place_id": place.get('place_id'),
             "source": "Google_Places",
         })
