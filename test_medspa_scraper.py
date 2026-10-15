@@ -923,22 +923,112 @@ def html_response(body):
     return handler
 
 
+class TestExtractEmail:
+    """What survives from a page has to be what a visitor would read off it."""
+
+    SITE = 'https://www.glow-spa.example/contact'
+
+    def extract(self, html_text):
+        return medspa_scraper.extract_email(html_text, self.SITE)
+
+    def test_reads_a_plain_address(self):
+        assert self.extract('<a href="mailto:info@glow-spa.example">Email</a>') \
+            == 'info@glow-spa.example'
+
+    def test_skips_the_address_of_whoever_built_the_site(self):
+        page = ('<!-- support@squarespace.com --><body>Contact: hello@glow-spa.example</body>')
+        assert self.extract(page) == 'hello@glow-spa.example'
+
+    def test_skips_a_blank_form_placeholder(self):
+        page = '<input placeholder="you@email.com"><p>book@glow-spa.example</p>'
+        assert self.extract(page) == 'book@glow-spa.example'
+
+    @pytest.mark.parametrize('asset', ['logo@2x.PNG', 'icon@1x.svg', 'hero@3x.JPEG'])
+    def test_skips_asset_filenames_whatever_their_case(self, asset):
+        page = f'<img src="{asset}"><p>info@glow-spa.example</p>'
+        assert self.extract(page) == 'info@glow-spa.example'
+
+    def test_an_address_hidden_in_a_script_loses_to_one_on_the_page(self):
+        # Both sit on the business domain, so only ignoring the script can decide this
+        page = ('<script>var owner="webmaster@glow-spa.example";</script>'
+                '<p>hello@glow-spa.example</p>')
+        assert self.extract(page) == 'hello@glow-spa.example'
+
+    def test_an_asset_filename_alone_yields_nothing(self):
+        assert self.extract('<img src="logo@2x.PNG">') == ''
+
+    @pytest.mark.parametrize(
+        'address',
+        ['support@squarespace.com', 'noreply@mailchimp.com', 'k@o1.ingest.sentry.io',
+         'you@email.com', 'info@yourdomain.com'],
+    )
+    def test_a_service_address_in_plain_text_is_still_refused(self, address):
+        assert self.extract(f'<p>Questions? {address}</p>') == ''
+
+    def test_skips_anything_inside_a_script(self):
+        page = ('<script>var t="a.b@c.dfunction";Sentry.init({dsn:"https://k@o1.sentry.io/4"})'
+                '</script><p>info@glow-spa.example</p>')
+        assert self.extract(page) == 'info@glow-spa.example'
+
+    def test_skips_marketing_platform_addresses_in_schema_markup(self):
+        page = ('<script type="application/ld+json">{"email":"noreply@mailchimp.com"}</script>'
+                '<p>owner@glow-spa.example</p>')
+        assert self.extract(page) == 'owner@glow-spa.example'
+
+    def test_reads_an_address_written_as_html_entities(self):
+        assert self.extract('<p>info&#64;glow-spa.example</p>') == 'info@glow-spa.example'
+
+    def test_refuses_an_address_that_ran_into_the_next_word(self):
+        # Returning info@glow-spa.exampleOpen would put mangled text in the list, and a
+        # missing address costs far less than one that cannot be trusted
+        assert self.extract('<p>Email info@glow-spa.exampleOpen Tuesdays</p>') == ''
+
+    def test_a_non_breaking_space_still_ends_an_address(self):
+        assert self.extract('<p>info@glow-spa.example&nbsp;Open</p>') == 'info@glow-spa.example'
+
+    def test_prefers_an_address_on_the_sites_own_domain(self):
+        page = '<p>glowmedspa@gmail.com</p><p>hi@glow-spa.example</p>'
+        assert self.extract(page) == 'hi@glow-spa.example'
+
+    def test_keeps_a_free_mailbox_when_it_is_all_there_is(self):
+        # Plenty of small businesses never set up a mailbox on their own domain
+        assert self.extract('<p>glowmedspa@gmail.com</p>') == 'glowmedspa@gmail.com'
+
+    def test_a_linked_address_beats_a_loose_one_on_the_same_domain(self):
+        page = 'hr@other.example <a href="mailto:book@other.example">Book</a>'
+        assert self.extract(page) == 'book@other.example'
+
+    def test_unwraps_an_encoded_mailto(self):
+        assert self.extract('<a href="mailto:book%40glow-spa.example">Book</a>') \
+            == 'book@glow-spa.example'
+
+    def test_returns_empty_when_the_page_offers_nothing(self):
+        assert self.extract('<p>Walk-ins welcome</p>') == ''
+
+
 class TestFetchEmailFromWebsite:
     @pytest.fixture
     async def website(self):
         async def not_found(request):
-            return web.Response(text='support@example.org', status=404, content_type='text/html')
+            return web.Response(text='support@glow-spa.example', status=404, content_type='text/html')
 
         app = web.Application()
-        app.router.add_get('/with-email', html_response('Contact: sales@example.com'))
+        app.router.add_get('/with-email', html_response('Contact: sales@glow-spa.example'))
         app.router.add_get('/without-email', html_response('No contact details here'))
         app.router.add_get('/image-only', html_response('<img src="logo@2x.png">'))
         app.router.add_get('/svg-only', html_response('<img src="icon@1x.svg">'))
         app.router.add_get('/jpeg-only', html_response('<img src="hero@2x.jpeg">'))
-        app.router.add_get('/image-and-email', html_response('<img src="banner@3x.jpg">support@example.org'))
+        app.router.add_get(
+            '/image-and-email',
+            html_response('<img src="banner@3x.jpg">support@glow-spa.example'),
+        )
         app.router.add_get(
             '/many-emails',
-            html_response('first@example.com then second@example.com then third@example.com'),
+            html_response('first@glow-spa.example then second@glow-spa.example then third@x.example'),
+        )
+        app.router.add_get(
+            '/linked-and-loose',
+            html_response('hr@glow-spa.example <a href="mailto:book@glow-spa.example">Book</a>'),
         )
         app.router.add_get('/not-found', not_found)
 
@@ -951,15 +1041,19 @@ class TestFetchEmailFromWebsite:
     async def test_returns_empty_string_for_invalid_input(self, website_url):
         assert await medspa_scraper.fetch_email_from_website(None, website_url) == ''
 
+    async def test_an_address_in_a_mailto_link_wins(self, session, website):
+        url = str(website.make_url('/linked-and-loose'))
+        assert await medspa_scraper.fetch_email_from_website(session, url) == 'book@glow-spa.example'
+
     async def test_extracts_email_from_html(self, session, website):
         url = str(website.make_url('/with-email'))
-        assert await medspa_scraper.fetch_email_from_website(session, url) == 'sales@example.com'
+        assert await medspa_scraper.fetch_email_from_website(session, url) == 'sales@glow-spa.example'
 
     async def test_returns_the_first_address_in_document_order(self, session, website):
         # Deduplicating through a set used to make this vary between runs
         url = str(website.make_url('/many-emails'))
         results = {await medspa_scraper.fetch_email_from_website(session, url) for _ in range(5)}
-        assert results == {'first@example.com'}
+        assert results == {'first@glow-spa.example'}
 
     async def test_returns_empty_string_when_page_has_no_email(self, session, website):
         url = str(website.make_url('/without-email'))
@@ -972,7 +1066,7 @@ class TestFetchEmailFromWebsite:
 
     async def test_picks_real_email_over_image_filename(self, session, website):
         url = str(website.make_url('/image-and-email'))
-        assert await medspa_scraper.fetch_email_from_website(session, url) == 'support@example.org'
+        assert await medspa_scraper.fetch_email_from_website(session, url) == 'support@glow-spa.example'
 
     async def test_returns_empty_string_on_non_200_status(self, session, website):
         url = str(website.make_url('/not-found'))

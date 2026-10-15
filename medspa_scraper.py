@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+import html
 import logging
 import os
 import re
@@ -7,6 +8,7 @@ import sqlite3
 import sys
 from datetime import datetime, timedelta, timezone
 from typing import NamedTuple
+from urllib.parse import unquote, urlsplit
 
 import aiohttp
 
@@ -29,7 +31,36 @@ KEYWORDS = [
     "Aesthetic Center",
 ]
 
-EMAIL_REGEX = r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
+EMAIL_PATTERN = re.compile(
+    r'[a-zA-Z0-9._%+-]+'              # the part before the @
+    r'@'
+    r'(?:[a-zA-Z0-9-]+\.)+'           # one or more domain labels
+    r'(?:[a-z]{2,10}|[A-Z]{2,10})'    # a top level domain, which is never mixed case
+    r'(?![a-zA-Z])'                   # a letter here means the match ran into the next word
+)
+
+# An address written into a link was put there so the business could be contacted
+MAILTO_PATTERN = re.compile(r'mailto:([^"\'>\s?&]+)', re.IGNORECASE)
+
+# Scripts carry analytics keys and schema markup, comments carry the notes of whoever
+# built the site, and neither is text a visitor would ever read off the page
+SCRIPTS_AND_COMMENTS = re.compile(
+    r'<script\b.*?</script>|<style\b.*?</style>|<!--.*?-->',
+    re.DOTALL | re.IGNORECASE,
+)
+
+# Addresses on these domains belong to the people who built or host the site, to a
+# third party service, or to a blank form waiting to be filled in
+NON_BUSINESS_DOMAINS = {
+    'squarespace.com', 'wix.com', 'wixpress.com', 'godaddy.com', 'weebly.com',
+    'shopify.com', 'wordpress.com', 'wordpress.org', 'duda.co', 'webflow.com',
+    'mailchimp.com', 'sentry.io', 'sentry-cdn.com', 'cloudflare.com',
+    'example.com', 'example.org', 'example.net', 'email.com', 'domain.com',
+    'yourdomain.com', 'yoursite.com', 'company.com', 'mysite.com', 'site.com',
+}
+
+# Asset filenames routinely contain an @, as in logo@2x.png
+ASSET_SUFFIXES = ('.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg', '.avif', '.ico', '.bmp')
 
 # US addresses put the ZIP straight after the two-letter state code, as in "Beverly Hills, CA 90210"
 ZIP_FROM_ADDRESS = re.compile(r'\b[A-Z]{2}\s+(\d{5})(?:-\d{4})?\b')
@@ -155,6 +186,51 @@ def extract_zip_code(address, fallback):
     return match.group(1) if match else str(fallback)
 
 
+def site_domain(website_url):
+    """The domain the site itself is served from, with any leading www dropped."""
+    host = urlsplit(website_url).hostname or ''
+    return host[4:] if host.startswith('www.') else host
+
+
+def is_business_address(address):
+    """Reject anything that is plainly not a way to reach the business."""
+    if address.lower().endswith(ASSET_SUFFIXES):
+        return False
+    domain = address.rsplit('@', 1)[1].lower()
+    return not any(
+        domain == blocked or domain.endswith('.' + blocked)
+        for blocked in NON_BUSINESS_DOMAINS
+    )
+
+
+def extract_email(html_text, website_url):
+    """Pick the business's own address out of a page, or return an empty string.
+
+    Taking the first address on the page is what produced image filenames, analytics
+    keys and the web designer's own address, so the page is narrowed to the text a
+    visitor could actually read and the remaining candidates are ranked. An address on
+    the site's own domain belongs to the business rather than to whoever built the
+    site, and an address inside a mailto link was put there to be written to.
+    """
+    readable = html.unescape(SCRIPTS_AND_COMMENTS.sub(' ', html_text))
+
+    linked = [unquote(address) for address in MAILTO_PATTERN.findall(readable)]
+    # dict.fromkeys keeps the order the addresses appear in, so reruns agree
+    candidates = list(dict.fromkeys(linked + EMAIL_PATTERN.findall(readable)))
+    usable = [address for address in candidates if is_business_address(address)]
+    if not usable:
+        return ""
+
+    own_domain = site_domain(website_url)
+    was_linked = set(linked)
+
+    def confidence(address):
+        return address.rsplit('@', 1)[1].lower() == own_domain, address in was_linked
+
+    # max keeps the earliest address among equals, so page order still decides ties
+    return max(usable, key=confidence)
+
+
 async def fetch_email_from_website(session, website_url):
     """Scrape an email address from a business website."""
     if not website_url or not isinstance(website_url, str):
@@ -168,16 +244,7 @@ async def fetch_email_from_website(session, website_url):
         # falls back to the same leniency so both stages agree a site is reachable.
         async with session.get(website_url, timeout=REQUEST_TIMEOUT, ssl=False) as response:
             if response.status == 200:
-                html_text = await response.text()
-                # dict.fromkeys keeps the order the addresses appear in, so reruns agree
-                emails = list(dict.fromkeys(re.findall(EMAIL_REGEX, html_text)))
-                # Filter out matches that are actually image filenames
-                valid_emails = [
-                    e for e in emails
-                    if not e.endswith(('.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg'))
-                ]
-                if valid_emails:
-                    return valid_emails[0]
+                return extract_email(await response.text(), website_url)
     except Exception:
         pass
     return ""
