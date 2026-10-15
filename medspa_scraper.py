@@ -428,6 +428,26 @@ async def run_medspa_scraper(
 ENRICHABLE_FIELDS = ['phone', 'website', 'email', 'address']
 
 
+def find_existing(cursor, item):
+    """Find the stored row for this business, if there is one.
+
+    place_id is the identity. The fallback covers the rare result Google returns
+    without one: those rows cannot be matched on anything stronger, and without the
+    fallback they would be inserted again on every single run.
+    """
+    if item['place_id']:
+        return cursor.execute(
+            'SELECT id FROM leads WHERE place_id = ?', (item['place_id'],)
+        ).fetchone()
+
+    # Two branches of a chain are distinguished by place_id, so narrowing by name and
+    # zip here can only merge rows that had no identity to begin with
+    return cursor.execute(
+        'SELECT id FROM leads WHERE place_id IS NULL AND business_name = ? AND zip_code = ?',
+        (item['business_name'], item['zip_code']),
+    ).fetchone()
+
+
 def enrich_existing(cursor, row_id, item):
     """Fill in only the fields that are still blank. Returns True if anything changed."""
     stored = cursor.execute(
@@ -462,9 +482,7 @@ def save_to_sqlite(leads):
     saved_count = 0
     enriched_count = 0
     for item in leads:
-        existing = cursor.execute(
-            'SELECT id FROM leads WHERE place_id = ?', (item['place_id'],)
-        ).fetchone()
+        existing = find_existing(cursor, item)
 
         if existing:
             enriched_count += enrich_existing(cursor, existing[0], item)

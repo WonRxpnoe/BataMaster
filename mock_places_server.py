@@ -102,7 +102,13 @@ async def handle_search(request):
     if next_token:
         payload['next_page_token'] = next_token
 
-    logger.info("search %r page %s -> %s results", query, 2 if page_token else 1, len(payload['results']))
+    # A page token carries no query, so log the zip code it resolved to instead
+    logger.info(
+        "search %s page %s -> %s results",
+        repr(query) if query else f'(token for {zip_code})',
+        2 if page_token else 1,
+        len(payload['results']),
+    )
     return web.json_response(payload)
 
 

@@ -760,6 +760,38 @@ class TestRescrapingAnExistingBusiness:
         assert save_to_sqlite([lead()]) == 0
         assert '0 gained a missing field' in capture_logs.text
 
+    def test_a_result_without_a_place_id_is_still_deduplicated(self):
+        """Google occasionally omits the id. Without a fallback those rows pile up.
+
+        The old name and zip constraint used to catch this, so dropping it has to be
+        paired with a match the insert path can fall back on.
+        """
+        for _ in range(3):
+            save_to_sqlite([lead(place_id=None)])
+
+        with sqlite3.connect(DB_PATH) as conn:
+            assert conn.execute('SELECT COUNT(*) FROM leads').fetchone()[0] == 1
+
+    def test_the_fallback_does_not_merge_two_branches(self):
+        # Both have ids, so the weaker name and zip match must never come into play
+        save_to_sqlite([
+            lead(business_name='SkinLab', place_id='place-rodeo'),
+            lead(business_name='SkinLab', place_id='place-wilshire'),
+        ])
+
+        with sqlite3.connect(DB_PATH) as conn:
+            assert conn.execute('SELECT COUNT(*) FROM leads').fetchone()[0] == 2
+
+    def test_a_result_without_an_id_does_not_absorb_one_that_has_an_id(self):
+        save_to_sqlite([lead(place_id='place-real')])
+
+        save_to_sqlite([lead(place_id=None)])
+
+        # The identified row is left alone, so the anonymous one becomes its own lead
+        with sqlite3.connect(DB_PATH) as conn:
+            rows = conn.execute('SELECT place_id FROM leads ORDER BY id').fetchall()
+        assert rows == [('place-real',), (None,)]
+
     def test_the_row_is_matched_by_place_id_not_by_name(self):
         save_to_sqlite([lead(phone='')])
 

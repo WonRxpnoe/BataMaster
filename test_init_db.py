@@ -215,6 +215,74 @@ class TestDroppingTheNameAndZipConstraint:
             names = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         assert 'leads_rebuilt' not in names
 
+    def test_an_interrupted_rebuild_can_be_run_again(self):
+        """A crash between the copy and the swap must not wedge every later run."""
+        import init_db as module
+
+        self.legacy_database_with([('Glow Med Spa', '90210', '555-0001')])
+
+        # Stop right after the copy, exactly where a crash would hurt most. The real
+        # sequence adds the later columns before rebuilding, so do that here too.
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        module.add_missing_columns(cursor)
+        columns = ', '.join(module.LEADS_COLUMNS)
+        cursor.execute(module.create_leads_sql(module.REBUILD_TABLE))
+        cursor.execute(
+            f'INSERT INTO {module.REBUILD_TABLE} (id, {columns}) SELECT id, {columns} FROM leads'
+        )
+        conn.commit()
+        conn.close()
+
+        init_db()
+
+        with sqlite3.connect(DB_PATH) as conn:
+            rows = conn.execute('SELECT business_name, phone FROM leads').fetchall()
+            tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        assert rows == [('Glow Med Spa', '555-0001')]
+        assert module.REBUILD_TABLE not in tables
+
+    def test_a_failed_rebuild_leaves_the_original_table_intact(self, monkeypatch):
+        import init_db as module
+
+        self.legacy_database_with([('Glow Med Spa', '90210', '555-0001')])
+
+        real_create = module.create_leads_sql
+
+        def fail_on_the_swap(table_name):
+            if table_name == module.REBUILD_TABLE:
+                # A column the copy cannot satisfy, so the rename never happens
+                return f'CREATE TABLE {module.REBUILD_TABLE} (id INTEGER PRIMARY KEY)'
+            return real_create(table_name)
+
+        monkeypatch.setattr(module, 'create_leads_sql', fail_on_the_swap)
+
+        with pytest.raises(sqlite3.Error):
+            init_db()
+
+        # Rolled back whole, so the data is still there to migrate on the next attempt
+        with sqlite3.connect(DB_PATH) as conn:
+            assert conn.execute('SELECT business_name FROM leads').fetchall() == [('Glow Med Spa',)]
+
+    def test_the_constraint_is_found_whatever_the_spacing(self):
+        import os
+
+        os.makedirs('data', exist_ok=True)
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute(
+                'CREATE TABLE leads (id INTEGER PRIMARY KEY AUTOINCREMENT, business_name TEXT, '
+                'industry TEXT, phone TEXT, website TEXT, email TEXT, state TEXT, zip_code TEXT, '
+                'address TEXT, source TEXT, '
+                'UNIQUE ( business_name , zip_code ))'
+            )
+            conn.execute("INSERT INTO leads (business_name, zip_code) VALUES ('Glow', '90210')")
+
+        init_db()
+
+        with sqlite3.connect(DB_PATH) as conn:
+            insert_lead(conn, 'Glow', '90210', place_id='place-second')
+            assert conn.execute('SELECT COUNT(*) FROM leads').fetchone()[0] == 2
+
     def test_a_rebuilt_database_is_not_rebuilt_again(self, caplog):
         self.legacy_database_with([('Glow Med Spa', '90210', '555-0001')])
         init_db()

@@ -32,7 +32,11 @@ LATER_COLUMNS = {
 
 # The original schema treated a name and a zip code as a business identity. Two
 # branches of one chain share both, so the second was silently dropped.
-LEGACY_NAME_ZIP_CONSTRAINT = 'UNIQUE(business_name, zip_code)'
+LEGACY_NAME_ZIP_COLUMNS = ['business_name', 'zip_code']
+
+# Scratch table for the rebuild, cleared first so an interrupted attempt cannot wedge
+# every later run
+REBUILD_TABLE = 'leads_rebuilt'
 
 
 def create_leads_sql(table_name):
@@ -55,11 +59,20 @@ def create_leads_sql(table_name):
     '''
 
 
-def table_sql(cursor, table_name):
-    row = cursor.execute(
-        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?", (table_name,)
-    ).fetchone()
-    return row[0] if row else ''
+def has_name_zip_constraint(cursor):
+    """Look for the index SQLite creates behind a UNIQUE clause in CREATE TABLE.
+
+    Reading the index rather than matching the stored CREATE statement as text means
+    spacing and formatting in an older database cannot hide the constraint.
+    """
+    for _, name, is_unique, origin, _ in cursor.execute('PRAGMA index_list(leads)'):
+        # origin 'u' marks an index backing a UNIQUE clause, 'c' a CREATE INDEX
+        if not is_unique or origin != 'u':
+            continue
+        columns = [row[2] for row in cursor.execute(f'PRAGMA index_info("{name}")')]
+        if columns == LEGACY_NAME_ZIP_COLUMNS:
+            return True
+    return False
 
 
 def add_missing_columns(cursor):
@@ -69,27 +82,43 @@ def add_missing_columns(cursor):
             cursor.execute(f'ALTER TABLE leads ADD COLUMN {column} {definition}')
 
 
-def drop_name_zip_constraint(cursor):
+def drop_name_zip_constraint(conn):
     """Rebuild leads without the old name and zip uniqueness, preserving every row.
 
     SQLite cannot drop a constraint in place, so the table has to be copied. Identity
     is left entirely to the unique index on place_id, which is what Google treats as
     one business.
+
+    The copy and the swap run as a single transaction, and any table left over from an
+    interrupted attempt is cleared first. Without both, a crash partway through would
+    leave a scratch table that makes every later run fail on a duplicate id.
     """
-    if LEGACY_NAME_ZIP_CONSTRAINT not in table_sql(cursor, 'leads'):
+    cursor = conn.cursor()
+    if not has_name_zip_constraint(cursor):
         return
 
     columns = ', '.join(LEADS_COLUMNS)
-    cursor.execute(create_leads_sql('leads_rebuilt'))
-    cursor.execute(f'INSERT INTO leads_rebuilt (id, {columns}) SELECT id, {columns} FROM leads')
-    cursor.execute('DROP TABLE leads')
-    cursor.execute('ALTER TABLE leads_rebuilt RENAME TO leads')
+    cursor.execute(f'DROP TABLE IF EXISTS {REBUILD_TABLE}')
+    cursor.execute('BEGIN')
+    try:
+        cursor.execute(create_leads_sql(REBUILD_TABLE))
+        cursor.execute(
+            f'INSERT INTO {REBUILD_TABLE} (id, {columns}) SELECT id, {columns} FROM leads'
+        )
+        cursor.execute('DROP TABLE leads')
+        cursor.execute(f'ALTER TABLE {REBUILD_TABLE} RENAME TO leads')
+    except Exception:
+        conn.rollback()
+        raise
+    conn.commit()
     logger.info('Rebuilt leads so branches of one chain are no longer merged')
 
 
 def init_db():
     os.makedirs(DB_DIR, exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
+    # Transactions are opened by hand, so the rebuild below is genuinely atomic
+    conn.isolation_level = None
     cursor = conn.cursor()
 
     # Readers no longer block the writer, so the cleaner and the scraper can overlap
@@ -97,7 +126,7 @@ def init_db():
 
     cursor.execute(create_leads_sql('leads'))
     add_missing_columns(cursor)
-    drop_name_zip_constraint(cursor)
+    drop_name_zip_constraint(conn)
 
     # A unique index rather than a column constraint, so existing databases can be
     # upgraded. SQLite treats NULLs as distinct, leaving rows scraped before place_id
