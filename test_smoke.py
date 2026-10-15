@@ -208,6 +208,78 @@ class TestFullPipeline:
         assert await clean(only_new=True) == (0, 0)
 
 
+class TestRescrapingFlowsThroughEveryStage:
+    """A field arriving on a second scrape has to survive cleaning and export.
+
+    The scraper's own suite proves the field is written. Only running the stages in
+    order shows whether the cleaner ever revisits its verdict, and whether the
+    exporter then picks the lead up.
+    """
+
+    NAME = 'Glow Med Spa 90210'
+
+    def blank_the_phone(self):
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute("UPDATE leads SET phone = '' WHERE business_name = ?", (self.NAME,))
+
+    def lead_row(self):
+        with sqlite3.connect(DB_PATH) as conn:
+            return conn.execute(
+                'SELECT phone, status FROM leads WHERE business_name = ?', (self.NAME,)
+            ).fetchone()
+
+    async def test_a_refilled_field_sends_the_lead_back_for_validation(self, pipeline):
+        await scrape(['90210'])
+        await clean()
+        self.blank_the_phone()
+
+        await scrape(['90210'])
+
+        # Back to 'new', because the verdict was reached without this phone number
+        assert self.lead_row() == ('(310) 555-1000', 'new')
+
+    async def test_only_new_then_picks_the_lead_back_up(self, pipeline):
+        await scrape(['90210'])
+        await clean()
+        self.blank_the_phone()
+        await scrape(['90210'])
+
+        await clean(only_new=True)
+
+        # Without the reset this lead would keep its stale verdict forever
+        assert self.lead_row() == ('(310) 555-1000', 'valid')
+
+    async def test_a_scrape_that_adds_nothing_leaves_verdicts_alone(self, pipeline):
+        await scrape(['90210'])
+        await clean()
+
+        await scrape(['90210'])
+
+        # No field was refilled, so nothing is dragged back through validation
+        with sqlite3.connect(DB_PATH) as conn:
+            assert conn.execute("SELECT COUNT(*) FROM leads WHERE status = 'new'").fetchone()[0] == 0
+
+
+class TestCostGuardsEndToEnd:
+    async def test_capping_the_pages_really_fetches_fewer_businesses(self, pipeline):
+        # The two mock zips hold identical businesses, so only the cap differs
+        capped = await run_medspa_scraper(
+            'mock-key', ['90210'], 'CA', keywords=['Med Spa'], max_pages=1
+        )
+        full = await run_medspa_scraper('mock-key', ['90211'], 'CA', keywords=['Med Spa'])
+
+        assert 0 < len(capped) < len(full)
+
+    async def test_a_capped_run_still_produces_an_exportable_lead(self, pipeline):
+        leads = await run_medspa_scraper(
+            'mock-key', ['90210'], 'CA', keywords=['Med Spa'], max_pages=1
+        )
+        save_to_sqlite(leads)
+        await clean()
+
+        assert export_leads(output_path=CSV_PATH) > 0
+
+
 class TestStageContracts:
     async def test_every_column_the_cleaner_reads_is_written_by_the_scraper(self, pipeline):
         await scrape(['90210'])

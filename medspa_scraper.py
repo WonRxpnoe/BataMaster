@@ -462,9 +462,13 @@ def enrich_existing(cursor, row_id, item):
     if not updates:
         return False
 
+    # Back to 'new' because the cleaner's verdict was reached without these fields.
+    # Leaving it alone would strand a lead that was rejected for having no phone
+    # number and has just been given one, since --only-new would never look again.
     assignments = ', '.join(f'{field} = ?' for field in updates)
     cursor.execute(
-        f'UPDATE leads SET {assignments} WHERE id = ?', (*updates.values(), row_id)
+        f"UPDATE leads SET {assignments}, status = 'new' WHERE id = ?",
+        (*updates.values(), row_id),
     )
     return True
 
