@@ -1,4 +1,3 @@
-import logging
 import sqlite3
 
 import pytest
@@ -14,12 +13,6 @@ from clean_leads import (
     parse_args,
 )
 from init_db import DB_PATH, init_db
-
-
-@pytest.fixture(autouse=True)
-def capture_logs(caplog):
-    caplog.set_level(logging.DEBUG, logger='clean_leads')
-    return caplog
 
 
 class FakeResponse:
@@ -135,6 +128,13 @@ class TestCheckWebsiteLive:
         )
 
         assert check_website_live('https://glow.example.com') is True
+        assert [call['verify'] for call in calls] == [True, False]
+
+    def test_a_bad_certificate_on_a_dead_host_is_still_a_rejection(self, monkeypatch):
+        # Nothing answers on the retry either, so leniency must not turn into a yes
+        calls = stub_get(monkeypatch, {}, bad_certificates={'https://glow.example.com'})
+
+        assert check_website_live('https://glow.example.com') is False
         assert [call['verify'] for call in calls] == [True, False]
 
     def test_a_dead_host_is_not_retried_without_verification(self, monkeypatch):

@@ -29,7 +29,8 @@ BUSINESS_TEMPLATES = [
     {'slug': 'radiance', 'name': 'Radiance Skin Clinic', 'has_site': True, 'email': None},
     {'slug': 'serenity', 'name': 'Serenity Facial Bar', 'has_site': False, 'email': None},
     {'slug': 'closed', 'name': 'Closed Aesthetics', 'has_site': True, 'email': None, 'closed': True},
-    {'slug': 'nophone', 'name': 'Quiet Esthetics', 'has_site': True, 'email': 'book@quiet.example', 'phone': None},
+    {'slug': 'nophone', 'name': 'Quiet Esthetics', 'has_site': True, 'phone': None,
+     'email': 'book@quiet.example'},
     {'slug': 'bounce', 'name': 'Bounce Aesthetics', 'has_site': True, 'phone': None,
      'email': 'owner@bounce.invalid'},
 ]

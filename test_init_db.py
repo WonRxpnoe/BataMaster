@@ -44,10 +44,10 @@ def run_in_tmp_dir(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
 
 
-def insert_lead(conn, business_name, zip_code):
+def insert_lead(conn, business_name, zip_code, place_id=None):
     conn.execute(
-        'INSERT INTO leads (business_name, zip_code) VALUES (?, ?)',
-        (business_name, zip_code),
+        'INSERT INTO leads (business_name, zip_code, place_id) VALUES (?, ?, ?)',
+        (business_name, zip_code, place_id),
     )
     conn.commit()
 
@@ -76,12 +76,23 @@ def test_is_idempotent_and_preserves_existing_rows():
     assert rows == [('Acme Plumbing', '78701')]
 
 
-def test_rejects_duplicate_name_and_zip():
+def test_keeps_two_branches_sharing_a_name_and_a_zip():
     init_db()
     with sqlite3.connect(DB_PATH) as conn:
-        insert_lead(conn, 'Acme Plumbing', '78701')
+        # A chain with two locations inside one zip code is two real leads
+        insert_lead(conn, 'Acme Plumbing', '78701', place_id='place-rodeo')
+        insert_lead(conn, 'Acme Plumbing', '78701', place_id='place-wilshire')
+        count = conn.execute('SELECT COUNT(*) FROM leads').fetchone()[0]
+    assert count == 2
+
+
+def test_rejects_the_same_place_id_twice():
+    init_db()
+    with sqlite3.connect(DB_PATH) as conn:
+        insert_lead(conn, 'Acme Plumbing', '78701', place_id='place-rodeo')
+        # Identity is the place id, which is what the keyword loop can repeat
         with pytest.raises(sqlite3.IntegrityError):
-            insert_lead(conn, 'Acme Plumbing', '78701')
+            insert_lead(conn, 'Acme Plumbing Downtown', '78702', place_id='place-rodeo')
 
 
 def test_allows_same_name_in_different_zip():
@@ -138,6 +149,99 @@ def test_migration_is_safe_to_run_repeatedly():
     assert status == 'valid'
 
 
+class TestDroppingTheNameAndZipConstraint:
+    """The old schema merged two branches of one chain. Upgrading must not lose rows."""
+
+    def legacy_database_with(self, rows):
+        import os
+
+        os.makedirs('data', exist_ok=True)
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute(LEGACY_SCHEMA)
+            conn.executemany(
+                'INSERT INTO leads (business_name, zip_code, phone) VALUES (?, ?, ?)', rows
+            )
+
+    def test_every_legacy_row_survives_the_rebuild(self):
+        self.legacy_database_with([
+            ('Glow Med Spa', '90210', '555-0001'),
+            ('Radiance Clinic', '90210', '555-0002'),
+            ('Glow Med Spa', '90211', '555-0003'),
+        ])
+
+        init_db()
+
+        with sqlite3.connect(DB_PATH) as conn:
+            rows = conn.execute(
+                'SELECT business_name, zip_code, phone FROM leads ORDER BY id'
+            ).fetchall()
+        assert rows == [
+            ('Glow Med Spa', '90210', '555-0001'),
+            ('Radiance Clinic', '90210', '555-0002'),
+            ('Glow Med Spa', '90211', '555-0003'),
+        ]
+
+    def test_row_ids_are_preserved_so_nothing_is_renumbered(self):
+        self.legacy_database_with([('Glow Med Spa', '90210', '555-0001')])
+        with sqlite3.connect(DB_PATH) as conn:
+            before = conn.execute('SELECT id FROM leads').fetchone()[0]
+
+        init_db()
+
+        with sqlite3.connect(DB_PATH) as conn:
+            assert conn.execute('SELECT id FROM leads').fetchone()[0] == before
+
+    def test_a_branch_can_be_added_after_the_rebuild(self):
+        self.legacy_database_with([('Glow Med Spa', '90210', '555-0001')])
+
+        init_db()
+
+        with sqlite3.connect(DB_PATH) as conn:
+            insert_lead(conn, 'Glow Med Spa', '90210', place_id='place-second-branch')
+            assert conn.execute('SELECT COUNT(*) FROM leads').fetchone()[0] == 2
+
+    def test_the_constraint_is_gone_from_the_stored_schema(self):
+        self.legacy_database_with([('Glow Med Spa', '90210', '555-0001')])
+
+        init_db()
+
+        with sqlite3.connect(DB_PATH) as conn:
+            sql = conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'leads'"
+            ).fetchone()[0]
+        assert 'UNIQUE(business_name, zip_code)' not in sql
+        # The rebuild table must not be left behind
+        with sqlite3.connect(DB_PATH) as conn:
+            names = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        assert 'leads_rebuilt' not in names
+
+    def test_a_rebuilt_database_is_not_rebuilt_again(self, caplog):
+        self.legacy_database_with([('Glow Med Spa', '90210', '555-0001')])
+        init_db()
+
+        caplog.clear()
+        with caplog.at_level('INFO', logger='init_db'):
+            init_db()
+
+        assert 'Rebuilt leads' not in caplog.text
+
+
+def test_the_database_uses_write_ahead_logging():
+    # WAL lets the cleaner read while the scraper writes, instead of one blocking the other
+    init_db()
+    with sqlite3.connect(DB_PATH) as conn:
+        assert conn.execute('PRAGMA journal_mode').fetchone()[0] == 'wal'
+
+
+def test_status_is_indexed_because_both_stages_filter_on_it():
+    init_db()
+    with sqlite3.connect(DB_PATH) as conn:
+        plan = conn.execute(
+            "EXPLAIN QUERY PLAN SELECT id FROM leads WHERE status = 'valid'"
+        ).fetchall()
+    assert any('idx_leads_status' in str(step) for step in plan), plan
+
+
 def test_place_id_is_unique_across_rows():
     init_db()
     with sqlite3.connect(DB_PATH) as conn:
@@ -147,7 +251,8 @@ def test_place_id_is_unique_across_rows():
         with pytest.raises(sqlite3.IntegrityError):
             # The same business found under a different keyword or search zip
             conn.execute(
-                "INSERT INTO leads (business_name, zip_code, place_id) VALUES ('Glow Spa', '90212', 'place-1')"
+                "INSERT INTO leads (business_name, zip_code, place_id) "
+                "VALUES ('Glow Spa', '90212', 'place-1')"
             )
 
 

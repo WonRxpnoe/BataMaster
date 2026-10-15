@@ -71,7 +71,10 @@ def export_leads(output_path=DEFAULT_OUTPUT, status='valid', live_site_only=Fals
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="Export leads from the database to a CSV file.")
-    parser.add_argument('--output', default=DEFAULT_OUTPUT, help=f'Destination path (default: {DEFAULT_OUTPUT})')
+    parser.add_argument(
+        '--output', default=DEFAULT_OUTPUT,
+        help=f'Destination path (default: {DEFAULT_OUTPUT})',
+    )
     parser.add_argument(
         '--status', default='valid', choices=['new', 'valid', 'invalid', 'all'],
         help='Only export leads with this status (default: valid)',

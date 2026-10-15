@@ -23,13 +23,6 @@ from mock_places_server import create_app
 CSV_PATH = 'data/leads.csv'
 
 
-@pytest.fixture(autouse=True)
-def fast_waits(monkeypatch):
-    monkeypatch.setattr(medspa_scraper, 'PAGE_TOKEN_DELAY', 0)
-    monkeypatch.setattr(medspa_scraper, 'RETRY_BACKOFF', 0)
-    monkeypatch.setattr(medspa_scraper, 'MIN_SECONDS_BETWEEN_REQUESTS', 0)
-
-
 @pytest.fixture
 async def pipeline(tmp_path, monkeypatch):
     """Point the scraper at the local mock and run everything inside a temp directory."""

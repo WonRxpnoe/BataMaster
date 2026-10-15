@@ -1,3 +1,4 @@
+data/
 *.csv
 *.db
 *.env
@@ -5,3 +6,6 @@
 .venv/
 __pycache__/
 *.pyc
+.pytest_cache/
+.coverage
+.mock.pid

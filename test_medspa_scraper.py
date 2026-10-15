@@ -1,5 +1,4 @@
 import asyncio
-import logging
 import sqlite3
 import time
 
@@ -26,20 +25,6 @@ from medspa_scraper import (
     run_medspa_scraper,
     save_to_sqlite,
 )
-
-
-@pytest.fixture(autouse=True)
-def fast_waits(monkeypatch):
-    """Strip the production delays so the suite does not sleep for real."""
-    monkeypatch.setattr(medspa_scraper, 'PAGE_TOKEN_DELAY', 0)
-    monkeypatch.setattr(medspa_scraper, 'RETRY_BACKOFF', 0)
-    monkeypatch.setattr(medspa_scraper, 'MIN_SECONDS_BETWEEN_REQUESTS', 0)
-
-
-@pytest.fixture(autouse=True)
-def capture_logs(caplog):
-    caplog.set_level(logging.DEBUG, logger='medspa_scraper')
-    return caplog
 
 
 @pytest.fixture
@@ -191,7 +176,9 @@ class TestCheckApiResponse:
 
 
 class TestRetries:
-    async def test_recovers_from_a_temporary_server_error(self, google, session, single_keyword, no_email_lookup):
+    async def test_recovers_from_a_temporary_server_error(
+        self, google, session, single_keyword, no_email_lookup
+    ):
         google.search_failures = 2
         google.search_payload = {'status': 'OK', 'results': [place('Glow Med Spa')]}
 
@@ -201,7 +188,9 @@ class TestRetries:
         # Two failures plus the successful third attempt
         assert len(google.search_queries) == 3
 
-    async def test_gives_up_after_the_attempt_limit(self, google, session, single_keyword, no_email_lookup, capture_logs):
+    async def test_gives_up_after_the_attempt_limit(
+        self, google, session, single_keyword, no_email_lookup, capture_logs
+    ):
         google.search_failures = 99
 
         leads = await run_medspa_scraper('key', ['90210'])
@@ -209,6 +198,30 @@ class TestRetries:
         assert leads == []
         assert len(google.search_queries) == medspa_scraper.MAX_ATTEMPTS
         assert 'failed after 3 attempts' in capture_logs.text
+
+    async def test_retries_when_the_host_cannot_be_reached(
+        self, google, monkeypatch, single_keyword, no_email_lookup, capture_logs
+    ):
+        # The everyday failure in the field is a refused connection or a timeout,
+        # which arrives as a plain exception rather than an API status
+        monkeypatch.setattr(medspa_scraper, 'SEARCH_URL', 'http://127.0.0.1:1/textsearch')
+
+        leads = await run_medspa_scraper('key', ['90210'])
+
+        assert leads == []
+        assert 'failed after 3 attempts' in capture_logs.text
+        assert 'ClientConnectorError' in capture_logs.text
+
+    async def test_an_unreachable_host_leaves_the_zip_open_for_a_retry(
+        self, google, monkeypatch, single_keyword, no_email_lookup
+    ):
+        init_db()
+        monkeypatch.setattr(medspa_scraper, 'SEARCH_URL', 'http://127.0.0.1:1/textsearch')
+
+        await run_medspa_scraper('key', ['90210'], state='CA')
+
+        with sqlite3.connect(DB_PATH) as conn:
+            assert conn.execute('SELECT COUNT(*) FROM scrape_runs').fetchone()[0] == 0
 
     async def test_does_not_retry_a_fatal_error(self, google, single_keyword, no_email_lookup):
         google.search_payload = {'status': 'REQUEST_DENIED', 'error_message': 'invalid key'}
@@ -337,6 +350,18 @@ class TestLoadPlaceDetails:
         assert incomplete == 1
         assert google.details_requests == ['place-1'] * medspa_scraper.MAX_ATTEMPTS
 
+    async def test_an_unexpected_error_is_not_swallowed_as_an_unfinished_lookup(
+        self, google, session, monkeypatch
+    ):
+        async def exploding_details(*args, **kwargs):
+            raise KeyError('a bug, not a network problem')
+
+        monkeypatch.setattr(medspa_scraper, 'get_place_details', exploding_details)
+
+        # Counting this as merely incomplete would hide a real defect behind a retry
+        with pytest.raises(KeyError):
+            await load_place_details(session, 'key', ['place-1'], {}, asyncio.Semaphore(2))
+
     async def test_never_exceeds_the_concurrency_limit(self, google, session):
         google.details_delay = 0.02
         place_ids = [f'place-{i}' for i in range(MAX_CONCURRENT_REQUESTS * 3)]
@@ -407,7 +432,9 @@ class TestRunMedspaScraper:
         await run_medspa_scraper('key', ['90210'], state='CA')
         assert google.search_queries == [f'{kw} in 90210, CA' for kw in KEYWORDS]
 
-    async def test_business_matching_every_keyword_is_billed_once(self, google, no_email_lookup, capture_logs):
+    async def test_business_matching_every_keyword_is_billed_once(
+        self, google, no_email_lookup, capture_logs
+    ):
         google.search_payload = {'status': 'OK', 'results': [place('Glow Med Spa')]}
         google.details_payload = {'status': 'OK', 'result': {'formatted_phone_number': '(310) 555-0100'}}
 
@@ -419,7 +446,9 @@ class TestRunMedspaScraper:
         assert f'1 unique businesses, {len(KEYWORDS) - 1} duplicate lookups avoided' in capture_logs.text
 
     async def test_rejected_key_aborts_and_carries_partial_results(self, google, no_email_lookup):
-        google.search_payload = {'status': 'REQUEST_DENIED', 'error_message': 'The provided API key is invalid.'}
+        google.search_payload = {
+            'status': 'REQUEST_DENIED', 'error_message': 'The provided API key is invalid.',
+        }
 
         with pytest.raises(FatalApiError) as excinfo:
             await run_medspa_scraper('bad-key', ['90210'])
@@ -428,7 +457,9 @@ class TestRunMedspaScraper:
         # The remaining keywords are skipped rather than repeating the same failure
         assert len(google.search_queries) == 1
 
-    async def test_permanent_search_error_keeps_other_keywords_running(self, google, no_email_lookup, capture_logs):
+    async def test_permanent_search_error_keeps_other_keywords_running(
+        self, google, no_email_lookup, capture_logs
+    ):
         google.search_payload = {'status': 'NOT_FOUND', 'error_message': 'nothing here'}
 
         leads = await run_medspa_scraper('key', ['90210'])
@@ -447,7 +478,9 @@ class TestCostGuards:
         assert google.search_queries == ['Med Spa in 90210, CA']
         assert 'Billable requests: 1 Text Search, 1 Place Details' in capture_logs.text
 
-    async def test_max_pages_stops_the_scraper_following_the_token(self, google, no_email_lookup, single_keyword):
+    async def test_max_pages_stops_the_scraper_following_the_token(
+        self, google, no_email_lookup, single_keyword
+    ):
         # The payload always offers another page, so only the limit can end this
         google.search_payload = {'status': 'OK', 'results': [place('Endless')], 'next_page_token': 'more'}
 
@@ -494,7 +527,9 @@ class TestMultipleZipCodes:
         await run_medspa_scraper('key', ['90210', '90211'], state='CA')
 
         with sqlite3.connect(DB_PATH) as conn:
-            rows = conn.execute('SELECT zip_code, state, leads_found FROM scrape_runs ORDER BY zip_code').fetchall()
+            rows = conn.execute(
+                'SELECT zip_code, state, leads_found FROM scrape_runs ORDER BY zip_code'
+            ).fetchall()
         assert rows == [('90210', 'CA', 1), ('90211', 'CA', 1)]
 
     async def test_an_unanswered_zip_is_not_recorded_as_scraped(
@@ -545,7 +580,9 @@ class TestMultipleZipCodes:
         with sqlite3.connect(DB_PATH) as conn:
             assert conn.execute('SELECT COUNT(*) FROM scrape_runs').fetchone()[0] == 0
 
-    async def test_a_fatal_error_leaves_the_unfinished_zip_unrecorded(self, google, no_email_lookup, single_keyword):
+    async def test_a_fatal_error_leaves_the_unfinished_zip_unrecorded(
+        self, google, no_email_lookup, single_keyword
+    ):
         init_db()
         google.search_payload = {'status': 'REQUEST_DENIED', 'error_message': 'invalid key'}
 
@@ -625,8 +662,8 @@ class TestSaveToSqlite:
         save_to_sqlite([lead()])
         with sqlite3.connect(DB_PATH) as conn:
             row = conn.execute(
-                'SELECT business_name, industry, phone, website, email, state, zip_code, address, source, place_id '
-                'FROM leads'
+                'SELECT business_name, industry, phone, website, email, '
+                'state, zip_code, address, source, place_id FROM leads'
             ).fetchone()
         assert row == (
             'Glow Med Spa',
@@ -656,11 +693,83 @@ class TestSaveToSqlite:
             assert conn.execute('SELECT COUNT(*) FROM leads').fetchone()[0] == 2
 
     def test_reports_inserted_count_and_coverage(self, capture_logs):
-        save_to_sqlite([lead(), lead(business_name='Bare Spa', place_id='p2', phone='', email='', address='')])
+        save_to_sqlite([
+            lead(),
+            lead(business_name='Bare Spa', place_id='p2', phone='', email='', address=''),
+        ])
 
         text = capture_logs.text
         assert 'Saved 2 new leads' in text
         assert 'Coverage of fetched leads: 1 with address, 1 with phone, 1 with email' in text
+
+    def test_repeats_within_one_batch_are_not_called_pre_existing(self, capture_logs):
+        # Five results, one business. Nothing was on record before this call.
+        save_to_sqlite([lead(industry=f'MedSpa/Esthetics ({keyword})') for keyword in KEYWORDS])
+
+        expected = f'Fetched {len(KEYWORDS)} results: 1 new businesses, 0 gained a missing field'
+        assert expected in capture_logs.text
+
+    def test_two_branches_sharing_a_name_and_zip_are_both_stored(self):
+        # The pair the old schema used to merge into one
+        save_to_sqlite([
+            lead(business_name='SkinLab', place_id='place-rodeo', address='100 Rodeo Dr'),
+            lead(business_name='SkinLab', place_id='place-wilshire', address='900 Wilshire Blvd'),
+        ])
+
+        with sqlite3.connect(DB_PATH) as conn:
+            rows = conn.execute('SELECT address FROM leads ORDER BY address').fetchall()
+        assert rows == [('100 Rodeo Dr',), ('900 Wilshire Blvd',)]
+
+
+class TestRescrapingAnExistingBusiness:
+    @pytest.fixture(autouse=True)
+    def workdir(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+
+    def stored(self):
+        with sqlite3.connect(DB_PATH) as conn:
+            return conn.execute('SELECT phone, email, website, address FROM leads').fetchone()
+
+    def test_a_blank_field_is_filled_in(self, capture_logs):
+        save_to_sqlite([lead(email='', phone='')])
+
+        assert save_to_sqlite([lead(email='found@later.example', phone='(310) 555-0100')]) == 0
+
+        phone, email, _, _ = self.stored()
+        assert (phone, email) == ('(310) 555-0100', 'found@later.example')
+        assert '1 gained a missing field' in capture_logs.text
+
+    def test_a_field_that_already_has_a_value_is_never_overwritten(self):
+        save_to_sqlite([lead(phone='(310) 555-0100')])
+
+        save_to_sqlite([lead(phone='(999) 999-9999')])
+
+        assert self.stored()[0] == '(310) 555-0100'
+
+    def test_a_blank_in_the_new_scrape_does_not_erase_what_is_stored(self):
+        save_to_sqlite([lead(email='hello@glow.example.com')])
+
+        save_to_sqlite([lead(email='')])
+
+        assert self.stored()[1] == 'hello@glow.example.com'
+
+    def test_nothing_is_reported_when_there_is_nothing_to_add(self, capture_logs):
+        save_to_sqlite([lead()])
+        capture_logs.clear()
+
+        assert save_to_sqlite([lead()]) == 0
+        assert '0 gained a missing field' in capture_logs.text
+
+    def test_the_row_is_matched_by_place_id_not_by_name(self):
+        save_to_sqlite([lead(phone='')])
+
+        # Google renamed the business, but it is the same place id
+        save_to_sqlite([lead(business_name='Glow Med Spa and Wellness', phone='(310) 555-0100')])
+
+        with sqlite3.connect(DB_PATH) as conn:
+            rows = conn.execute('SELECT business_name, phone FROM leads').fetchall()
+        # One row, enriched in place. The stored name is left alone.
+        assert rows == [('Glow Med Spa', '(310) 555-0100')]
 
 
 class TestCommandLine:

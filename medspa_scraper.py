@@ -424,8 +424,33 @@ async def run_medspa_scraper(
     return all_leads
 
 
+# Fields a later scrape may fill in, but must never overwrite once they hold a value
+ENRICHABLE_FIELDS = ['phone', 'website', 'email', 'address']
+
+
+def enrich_existing(cursor, row_id, item):
+    """Fill in only the fields that are still blank. Returns True if anything changed."""
+    stored = cursor.execute(
+        f"SELECT {', '.join(ENRICHABLE_FIELDS)} FROM leads WHERE id = ?", (row_id,)
+    ).fetchone()
+
+    updates = {
+        field: item[field]
+        for field, current in zip(ENRICHABLE_FIELDS, stored)
+        if not current and item[field]
+    }
+    if not updates:
+        return False
+
+    assignments = ', '.join(f'{field} = ?' for field in updates)
+    cursor.execute(
+        f'UPDATE leads SET {assignments} WHERE id = ?', (*updates.values(), row_id)
+    )
+    return True
+
+
 def save_to_sqlite(leads):
-    """Persist the results to the local database."""
+    """Persist the results, filling gaps in businesses that are already on record."""
     if not leads:
         logger.info("No valid leads were scraped")
         return 0
@@ -435,7 +460,16 @@ def save_to_sqlite(leads):
     cursor = conn.cursor()
 
     saved_count = 0
+    enriched_count = 0
     for item in leads:
+        existing = cursor.execute(
+            'SELECT id FROM leads WHERE place_id = ?', (item['place_id'],)
+        ).fetchone()
+
+        if existing:
+            enriched_count += enrich_existing(cursor, existing[0], item)
+            continue
+
         cursor.execute('''
             INSERT OR IGNORE INTO leads
             (business_name, industry, phone, website, email, state, zip_code, address, source, place_id)
@@ -455,7 +489,14 @@ def save_to_sqlite(leads):
     with_email = sum(1 for item in leads if item['email'])
 
     logger.info("Saved %s new leads to %s", saved_count, DB_PATH)
-    logger.info("Fetched %s, skipped %s already in the database", len(leads), len(leads) - saved_count)
+    # Results outnumber businesses, because one business answers several keywords
+    logger.info(
+        "Fetched %s results: %s new businesses, %s gained a missing field, %s already complete",
+        len(leads),
+        saved_count,
+        enriched_count,
+        len(leads) - saved_count - enriched_count,
+    )
     logger.info(
         "Coverage of fetched leads: %s with address, %s with phone, %s with email",
         with_address,
@@ -500,7 +541,9 @@ def main(argv=None):
 
     api_key = os.getenv("GOOGLE_API_KEY", "")
     if not api_key or api_key == "YOUR_API_KEY_HERE":
-        logger.error("Set the GOOGLE_API_KEY environment variable to your Google Places API key before running.")
+        logger.error(
+            "Set the GOOGLE_API_KEY environment variable to your Google Places API key before running."
+        )
         return 1
 
     try:

@@ -5,12 +5,13 @@ Lead pipeline for med spa and skin care businesses, built on the Google Places A
 ## Setup
 
 ```bash
-python3 -m venv .venv
-.venv/bin/pip install -r requirements-dev.txt
+make install
 export GOOGLE_API_KEY=your-key-here
 ```
 
-The database, the CSV exports, and `.env` files are all gitignored.
+`make check` runs the linters and the suite, which is also what CI runs on every
+push. `make dryrun` exercises all three stages against the local mock. The `data/`
+directory and `.env` files are gitignored.
 
 ## Pipeline
 
@@ -76,10 +77,17 @@ branch the cleaner has to decide between appears at least once.
 
 ## Schema
 
-`leads` holds one row per business, deduplicated on `place_id`. A lead is `valid`
-when it has either a usable phone number or a deliverable email. `website_live`
-records the site check separately, so a stricter list is a query rather than a
-code change:
+`leads` holds one row per business, identified by `place_id`. That is deliberately
+the only identity: a name and a zip code are shared by two branches of one chain, so
+using them would silently merge two real leads into one.
+
+Re-scraping a business already on record fills in fields that are still blank and
+leaves everything else alone, so a later run can add an email without overwriting a
+phone number that was corrected by hand.
+
+A lead is `valid` when it has either a usable phone number or a deliverable email.
+`website_live` records the site check separately, so a stricter list is a query
+rather than a code change:
 
 ```sql
 SELECT * FROM leads WHERE status = 'valid' AND website_live = 1;
@@ -91,9 +99,11 @@ SELECT * FROM leads WHERE status = 'valid' AND website_live = 1;
 ## Tests
 
 ```bash
-.venv/bin/python -m pytest
+make test        # the suite
+make coverage    # the suite with a per-file coverage report
 ```
 
 Each module has its own suite against mocked HTTP and DNS. `test_smoke.py` runs all
 three stages in sequence against the mock server, which is what catches a column or
-a status value drifting apart between stages.
+a status value drifting apart between stages. Nothing in the suite touches the
+network or the real database: `conftest.py` gives every test its own directory.
