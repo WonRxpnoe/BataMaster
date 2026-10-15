@@ -3,15 +3,20 @@ import logging
 import re
 import sqlite3
 import sys
-import warnings
 
 import dns.resolver
 import requests
+import urllib3
 from urllib3.exceptions import InsecureRequestWarning
 
 from init_db import DB_PATH, init_db
 
 logger = logging.getLogger(__name__)
+
+# Retrying without verification is a deliberate fallback, so silence the warning once
+# here rather than per call. warnings.catch_warnings() swaps a global filter list and
+# would race as soon as liveness checks run on more than one thread.
+urllib3.disable_warnings(InsecureRequestWarning)
 
 EMAIL_REGEX = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
 
@@ -69,9 +74,7 @@ def check_website_live(website):
         return False
 
     try:
-        with warnings.catch_warnings():
-            warnings.simplefilter('ignore', InsecureRequestWarning)
-            return _answers(website, verify=False)
+        return _answers(website, verify=False)
     except Exception:
         return False
 

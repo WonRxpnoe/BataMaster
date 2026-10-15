@@ -194,6 +194,41 @@ class TestCleanAndValidateLeads:
         stub_mx(monkeypatch, {'example.com'})
         stub_get(monkeypatch, {'https://glow.example.com': 200})
 
+    def test_the_scraper_can_still_write_while_cleaning(self, monkeypatch):
+        """Progress is committed per lead, not held in one transaction to the end.
+
+        A single transaction would keep the write lock across every DNS and HTTP call,
+        so a scrape running alongside a long clean would fail with 'database is locked'.
+        """
+        self.insert(business_name='First Spa', zip_code='90210')
+        self.insert(business_name='Second Spa', zip_code='90211')
+        stub_mx(monkeypatch, {'example.com'})
+
+        attempts = []
+
+        def write_as_the_scraper_would(website):
+            # Runs between leads, exactly where the lock used to still be held
+            other = sqlite3.connect(DB_PATH, timeout=0.1)
+            try:
+                other.execute(
+                    "INSERT INTO scrape_runs (zip_code, state, scraped_at, leads_found) "
+                    "VALUES (?, 'CA', '2026-01-01T00:00:00+00:00', 1)",
+                    (str(90300 + len(attempts)),),
+                )
+                other.commit()
+                attempts.append('wrote')
+            except sqlite3.OperationalError as error:
+                attempts.append(str(error))
+            finally:
+                other.close()
+            return True
+
+        monkeypatch.setattr(clean_leads, 'check_website_live', write_as_the_scraper_would)
+        clean_and_validate_leads()
+
+        # The second attempt is the telling one, since by then a lead was already updated
+        assert attempts == ['wrote', 'wrote']
+
     def test_marks_a_fully_valid_lead(self, monkeypatch, capture_logs):
         self.insert()
         self.pass_everything(monkeypatch)
