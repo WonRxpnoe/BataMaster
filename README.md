@@ -44,6 +44,23 @@ and `website_live` columns. Nothing is ever deleted.
 
 Add `--verbose` to the scraper or the cleaner for one log line per record.
 
+## Dry run without an API key
+
+`mock_places_server.py` serves fake Places responses and the business websites they
+point at, so the real commands can be exercised end to end for free.
+
+```bash
+.venv/bin/python mock_places_server.py &
+export PLACES_BASE_URL=http://127.0.0.1:8899 GOOGLE_API_KEY=mock-key
+.venv/bin/python medspa_scraper.py --zip 90210 90211
+.venv/bin/python clean_leads.py
+.venv/bin/python export_leads.py
+```
+
+Unset `PLACES_BASE_URL` to go back to the real API. The mock data deliberately
+includes a permanently closed business, one with no website, one whose site has no
+email, and one with no phone number.
+
 ## Schema
 
 `leads` holds one row per business, deduplicated on `place_id`. A lead is `valid`
@@ -63,3 +80,7 @@ SELECT * FROM leads WHERE status = 'valid' AND website_live = 1;
 ```bash
 .venv/bin/python -m pytest
 ```
+
+Each module has its own suite against mocked HTTP and DNS. `test_smoke.py` runs all
+three stages in sequence against the mock server, which is what catches a column or
+a status value drifting apart between stages.

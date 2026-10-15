@@ -13,8 +13,11 @@ from init_db import DB_PATH, init_db
 
 logger = logging.getLogger(__name__)
 
-SEARCH_URL = "https://maps.googleapis.com/maps/api/place/textsearch/json"
-DETAILS_URL = "https://maps.googleapis.com/maps/api/place/details/json"
+# Overridable so the pipeline can be exercised against a local mock server
+PLACES_BASE_URL = os.getenv('PLACES_BASE_URL', 'https://maps.googleapis.com/maps/api/place')
+
+SEARCH_URL = f"{PLACES_BASE_URL}/textsearch/json"
+DETAILS_URL = f"{PLACES_BASE_URL}/details/json"
 
 # Full keyword list for light aesthetics and beauty businesses
 KEYWORDS = [
