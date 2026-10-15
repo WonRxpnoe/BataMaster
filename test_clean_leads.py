@@ -43,12 +43,14 @@ def stub_mx(monkeypatch, domains_with_mx):
     monkeypatch.setattr(clean_leads.dns.resolver, 'resolve', fake_resolve)
 
 
-def stub_get(monkeypatch, status_by_url):
+def stub_get(monkeypatch, status_by_url, bad_certificates=()):
     """Answer requests from a lookup table and record every call made."""
     calls = []
 
-    def fake_get(url, timeout=None, allow_redirects=None, headers=None, stream=None):
-        calls.append({'url': url, 'headers': headers, 'stream': stream})
+    def fake_get(url, timeout=None, allow_redirects=None, headers=None, stream=None, verify=True):
+        calls.append({'url': url, 'headers': headers, 'stream': stream, 'verify': verify})
+        if url in bad_certificates and verify:
+            raise clean_leads.requests.exceptions.SSLError('certificate has expired')
         if url not in status_by_url:
             raise Exception('connection refused')
         return FakeResponse(status_by_url[url])
@@ -117,6 +119,29 @@ class TestCheckWebsiteLive:
     def test_rejects_unreachable_host(self, monkeypatch):
         stub_get(monkeypatch, {})
         assert check_website_live('https://glow.example.com') is False
+
+    def test_verifies_the_certificate_first(self, monkeypatch):
+        calls = stub_get(monkeypatch, {'https://glow.example.com': 200})
+        check_website_live('https://glow.example.com')
+        assert [call['verify'] for call in calls] == [True]
+
+    def test_a_lapsed_certificate_does_not_kill_the_lead(self, monkeypatch):
+        # The scraper reads these pages unverified, so rejecting the business here
+        # would contradict the email it already pulled off the very same page
+        calls = stub_get(
+            monkeypatch,
+            {'https://glow.example.com': 200},
+            bad_certificates={'https://glow.example.com'},
+        )
+
+        assert check_website_live('https://glow.example.com') is True
+        assert [call['verify'] for call in calls] == [True, False]
+
+    def test_a_dead_host_is_not_retried_without_verification(self, monkeypatch):
+        calls = stub_get(monkeypatch, {})
+        assert check_website_live('https://glow.example.com') is False
+        # Only a certificate complaint earns a second attempt
+        assert len(calls) == 1
 
 
 def test_creates_the_database_without_running_init_db_first(tmp_path, monkeypatch, capture_logs):

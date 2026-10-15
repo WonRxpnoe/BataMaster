@@ -162,6 +162,9 @@ async def fetch_email_from_website(session, website_url):
         website_url = 'https://' + website_url
 
     try:
+        # Certificates go unverified on purpose, since small business sites let them
+        # lapse constantly and only a public email is read off the page. clean_leads
+        # falls back to the same leniency so both stages agree a site is reachable.
         async with session.get(website_url, timeout=REQUEST_TIMEOUT, ssl=False) as response:
             if response.status == 200:
                 html_text = await response.text()

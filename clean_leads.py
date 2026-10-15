@@ -3,9 +3,11 @@ import logging
 import re
 import sqlite3
 import sys
+import warnings
 
 import dns.resolver
 import requests
+from urllib3.exceptions import InsecureRequestWarning
 
 from init_db import DB_PATH, init_db
 
@@ -36,6 +38,20 @@ def check_email_mx(email):
         return False
 
 
+def _answers(website, verify):
+    # stream=True reads the status line without downloading the whole page
+    with requests.get(
+        website,
+        timeout=REQUEST_TIMEOUT,
+        allow_redirects=True,
+        headers={'User-Agent': BROWSER_USER_AGENT},
+        stream=True,
+        verify=verify,
+    ) as response:
+        # Anything below 400 means the server answered for this address
+        return response.status_code < 400
+
+
 def check_website_live(website):
     """Check that the website still responds, flagging closed or expired businesses."""
     if not website:
@@ -43,16 +59,19 @@ def check_website_live(website):
     if not website.startswith(('http://', 'https://')):
         website = 'https://' + website
     try:
-        # stream=True reads the status line without downloading the whole page
-        with requests.get(
-            website,
-            timeout=REQUEST_TIMEOUT,
-            allow_redirects=True,
-            headers={'User-Agent': BROWSER_USER_AGENT},
-            stream=True,
-        ) as response:
-            # Anything below 400 means the server answered for this address
-            return response.status_code < 400
+        return _answers(website, verify=True)
+    except requests.exceptions.SSLError:
+        # A neglected certificate says nothing about whether the business exists, and
+        # the scraper already reads these sites unverified. Rejecting the lead here
+        # would contradict the email it just pulled off the very same page.
+        logger.debug("Certificate rejected for %s, retrying without verification", website)
+    except Exception:
+        return False
+
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore', InsecureRequestWarning)
+            return _answers(website, verify=False)
     except Exception:
         return False
 
