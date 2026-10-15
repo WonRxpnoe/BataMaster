@@ -1,6 +1,7 @@
 import argparse
 import logging
 import os
+import re
 import sqlite3
 import sys
 
@@ -28,6 +29,86 @@ EXPORT_COLUMNS = [
 ]
 
 
+def _digits(value):
+    return re.sub(r'\D', '', str(value or ''))
+
+
+def _simplified(value):
+    """Reduce a name or an address to the core that survives rewording."""
+    return re.sub(r'[^a-z0-9]', '', str(value or '').lower())
+
+
+def contact_signals(row):
+    """The identifiers that, shared at one address, mean two listings are one business.
+
+    A name is deliberately excluded: Google punctuates the same business differently
+    between its duplicate entries, so "Quiet Esthetics" and "Quiet Esthetics LLC" must
+    still be recognised as one shop.
+    """
+    signals = set()
+    phone = _digits(row['phone'])[-10:]
+    if len(phone) == 10:
+        signals.add(('phone', phone))
+    email = str(row['email'] or '').strip().lower()
+    if email:
+        signals.add(('email', email))
+    website = _simplified(row['website'])
+    if website:
+        signals.add(('website', website))
+    return signals
+
+
+def group_one_business_together(frame):
+    """Label each listing with the business it belongs to.
+
+    Listings are only ever compared within one street address, which is what keeps
+    branches of a chain apart: they share a central phone number and a website, but
+    never an address. Within a single address, any shared phone, email or website means
+    Google listed one shop twice, which it does whenever a business has a duplicate
+    entry. Chaining the matches lets a listing carrying only an email join one carrying
+    only a phone, as long as some third listing ties the two together.
+    """
+    parent = list(range(len(frame)))
+
+    def root(index):
+        while parent[index] != index:
+            parent[index] = parent[parent[index]]
+            index = parent[index]
+        return index
+
+    first_seen = {}
+    for position, (_, row) in enumerate(frame.iterrows()):
+        address = _simplified(row['address'])
+        keys = [(address, signal) for signal in contact_signals(row)]
+        # A listing with no way to reach it at all can only be matched on its name
+        keys = keys or [(address, ('name', _simplified(row['business_name'])))]
+        for key in keys:
+            if key in first_seen:
+                parent[root(position)] = root(first_seen[key])
+            else:
+                first_seen[key] = position
+    return [root(position) for position in range(len(frame))]
+
+
+def _first_present(values):
+    """Take the first value a column actually carries across the merged listings."""
+    present = values[values.notna() & (values.astype(str) != '')]
+    return present.iloc[0] if len(present) else values.iloc[0]
+
+
+def merge_duplicate_listings(frame):
+    """Collapse repeated listings of one business into a single row.
+
+    The surviving row keeps the first value each column actually has, so a listing
+    that carried only an email still contributes that email to the merged result.
+    """
+    if frame.empty:
+        return frame
+    groups = group_one_business_together(frame)
+    merged = frame.groupby(groups, sort=False).agg(_first_present)
+    return merged.reset_index(drop=True).sort_values('business_name', ignore_index=True)
+
+
 def build_query(status=None, live_site_only=False):
     """Build the export query and its parameters from the requested filters."""
     query = f"SELECT {', '.join(EXPORT_COLUMNS)} FROM leads"
@@ -53,6 +134,12 @@ def export_leads(output_path=DEFAULT_OUTPUT, status='valid', live_site_only=Fals
 
     with sqlite3.connect(DB_PATH) as conn:
         frame = pd.read_sql_query(query, conn, params=params)
+
+    listings = len(frame)
+    frame = merge_duplicate_listings(frame)
+    if listings > len(frame):
+        logger.info("Merged %s repeat listings of a business already in the list",
+                    listings - len(frame))
 
     # Businesses with no website leave this NULL, which would otherwise widen the whole
     # column to float and write every flag as 1.0

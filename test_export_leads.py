@@ -1,5 +1,6 @@
 import logging
 import sqlite3
+import zlib
 
 import pandas as pd
 import pytest
@@ -22,13 +23,17 @@ def workdir(tmp_path, monkeypatch):
 
 
 def insert(business_name, status='valid', website_live=1, **overrides):
+    # Every fake business gets its own street number. Listings are only ever compared
+    # within one address, so sharing one would make the exporter rightly read these as
+    # repeat listings of a single shop and merge them.
+    street_number = zlib.crc32(business_name.encode()) % 9000 + 100
     row = {
         'business_name': business_name,
         'industry': 'MedSpa/Esthetics (Med Spa)',
         'phone': '(310) 555-0100',
         'email': 'sales@example.com',
         'website': 'https://glow.example.com',
-        'address': '1 Main St, Beverly Hills, CA 90210, USA',
+        'address': f'{street_number} Main St, Beverly Hills, CA 90210, USA',
         'zip_code': '90210',
         'state': 'CA',
         'status': status,
@@ -139,6 +144,75 @@ class TestExportLeads:
         export_leads(output_path='leads.csv')
 
         assert (workdir / 'leads.csv').is_file()
+
+
+class TestRepeatListingsBecomeOneBusiness:
+    """Google lists some businesses more than once, so one shop arrives several times."""
+
+    SHARED = {'address': '1 Main St, Beverly Hills, CA 90210, USA'}
+
+    def names(self, workdir):
+        return pd.read_csv(workdir / DEFAULT_OUTPUT)['business_name'].tolist()
+
+    def test_the_same_shop_listed_twice_appears_once(self, workdir):
+        insert('Glow Med Spa', **self.SHARED)
+        insert('Glow Med Spa', place_id='other-listing', **self.SHARED)
+
+        assert export_leads() == 1
+        assert self.names(workdir) == ['Glow Med Spa']
+
+    def test_a_renamed_duplicate_is_still_one_shop(self, workdir):
+        # Google punctuates its duplicate entries differently, so the name cannot decide
+        insert('Quiet Esthetics', phone='', **self.SHARED)
+        insert('Quiet Esthetics LLC', phone='', place_id='other-listing', **self.SHARED)
+
+        assert export_leads() == 1
+
+    def test_branches_of_a_chain_are_kept_apart(self, workdir):
+        # One central phone number and one website, but two separate shops to contact
+        insert('Radiance Skin Clinic', address='12 Rodeo Dr, Beverly Hills, CA 90210, USA')
+        insert('Radiance Skin Clinic', place_id='second-branch',
+               address='88 Sunset Blvd, Beverly Hills, CA 90210, USA')
+
+        assert export_leads() == 2
+
+    def test_a_neighbour_in_the_same_building_is_not_absorbed(self, workdir):
+        insert('Glow Med Spa', **self.SHARED)
+        insert('Serenity Facial Bar', phone='(310) 555-9999', email='hi@serenity.example',
+               website='https://serenity.example', **self.SHARED)
+
+        assert export_leads() == 2
+
+    def test_the_surviving_row_keeps_every_contact_detail_found(self, workdir):
+        # Each listing carries a different fragment, and the lead needs all of them
+        insert('Glow Med Spa', email='', website='', **self.SHARED)
+        insert('Glow Medspa', email='', place_id='listing-2', **self.SHARED)
+        insert('Glow Med Spa Inc', phone='', place_id='listing-3', **self.SHARED)
+
+        assert export_leads() == 1
+
+        row = pd.read_csv(workdir / DEFAULT_OUTPUT).loc[0]
+        assert row['phone'] == '(310) 555-0100'
+        assert row['website'] == 'https://glow.example.com'
+        assert row['email'] == 'sales@example.com'
+
+    def test_merging_is_reported(self, workdir, capture_logs):
+        insert('Glow Med Spa', **self.SHARED)
+        insert('Glow Med Spa', place_id='other-listing', **self.SHARED)
+
+        export_leads()
+
+        assert 'Merged 1 repeat listing' in capture_logs.text
+
+    def test_nothing_is_reported_when_no_business_repeats(self, workdir, capture_logs):
+        insert('Glow Med Spa')
+        insert('Radiance Skin Clinic')
+
+        assert export_leads() == 2
+        assert 'Merged' not in capture_logs.text
+
+    def test_an_empty_list_is_left_alone(self, workdir):
+        assert export_leads() == 0
 
 
 class TestCommandLine:
