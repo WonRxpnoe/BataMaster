@@ -1,0 +1,44 @@
+---
+description: Evidence-based bug hunting for the leads pipeline
+alwaysApply: true
+---
+
+# Bug hunting in this pipeline
+
+The owner is not an engineer and describes goals as business outcomes. Translate
+those into technical checks. Never ask the owner to supply a failure scenario, a
+file to inspect, or a test to write.
+
+## Evidence, not opinion
+
+- Prove a bug with a script that runs and prints the wrong result, before fixing it.
+- After fixing, revert the fix and show a test goes red. A fix no test protects is
+  not finished.
+- If something cannot be reproduced, report "not reproduced" rather than
+  "possible risk". Reading code produces opinions; running code produces facts.
+- Close by listing the assumptions that were not verified.
+
+## Scenarios to work through
+
+Each line is an outcome that would make the pipeline worthless to its owner. Derive
+the technical check from it. Work through all of them; do not ask which to use.
+
+- The same business appears twice in the list
+- A business in the list has closed down
+- A business has neither a phone number nor an email, so it cannot be contacted
+- A business that should have been found is missing from the list
+- A second run returns fewer leads than the first
+- An area reported as searched was only partly searched
+- The bill is larger than the number of leads can justify
+- The CSV will not open or import cleanly
+- A lead that was already contacted gets contacted again
+
+## Where stale verdicts hide
+
+`status`, `website_live` and the rows in `scrape_runs` are stored conclusions, not
+live values. Any change touching the data a conclusion rests on must also invalidate
+that conclusion, or a later stage will trust a verdict whose basis is gone.
+
+Most tests here build an empty database and run one stage once, so they cannot see
+this class of bug. Exercise a second run, a run days later, an interrupted run, and
+two stages at once.
